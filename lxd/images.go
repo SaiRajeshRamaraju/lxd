@@ -1622,27 +1622,32 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 	}
 
 	for fingerprint, projects := range imagesProjectsMap {
-		hasAccess := false
-
-		image, err := doImageGet(ctx, tx, projects[0], fingerprint, public)
-		if err != nil {
-			continue
-		}
-
 		for _, project := range projects {
-			if image.Public || hasPermission(entity.ImageURL(project, fingerprint)) {
-				hasAccess = true
-				break
+			if !hasPermission(entity.ImageURL(project, fingerprint)) {
+				// Check if the image is public
+				image, err := doImageGet(ctx, tx, project, fingerprint, public)
+				if err != nil {
+					continue
+				}
+
+				if !image.Public {
+					continue
+				}
 			}
-		}
 
-		if !hasAccess {
-			continue
-		}
+			// If we are just listing names, we don't need to load the image unless we need to check if it's public
+			if !mustLoadObjects {
+				// If we are here, we have access, so we can just append the URL
+				resultString = append(resultString, api.NewURL().Path(version.APIVersion, "images", fingerprint).String())
+				continue
+			}
 
-		if !mustLoadObjects {
-			resultString = append(resultString, api.NewURL().Path(version.APIVersion, "images", fingerprint).String())
-		} else {
+			// Load the image to check filters or return full object
+			image, err := doImageGet(ctx, tx, project, fingerprint, public)
+			if err != nil {
+				continue
+			}
+
 			if clauses != nil && len(clauses.Clauses) > 0 {
 				match, err := filter.Match(*image, *clauses)
 				if err != nil {
