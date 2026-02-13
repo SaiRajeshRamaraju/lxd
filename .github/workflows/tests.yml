@@ -545,7 +545,9 @@ jobs:
         test:
           - cgroup
           - cloud-init
-          - cluster
+          # Known broken on 24.04 with HWE kernel (used by GHA runners starting on 2026-02-12)
+          # (https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2141715)
+          #- cluster
           - container
           - container-copy
           - container-nesting
@@ -673,7 +675,7 @@ jobs:
 
       # for simplicity, just use one cache directory
       # and make it valid for one day
-      - uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      - uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         id: cache-restore
         if: ${{ matrix.test == 'qemu-external-vm' }}
         with:
@@ -770,6 +772,14 @@ jobs:
 
           sudo --preserve-env="${SUDO_PRESERVE_ENV}" ./bin/local-run "tests/${TEST_SCRIPT}" "${SNAP_TRACK}/${SNAP_RISK}" ${EXTRA_ARGS:-}
 
+          # Cleanly stopping `snap.lxd.daemon.service` will ensure that any Go
+          # coverage data is flushed to disk and can be collected by the upload
+          # step below. If the service is not stopped, we might end up with
+          # partial or no coverage data at all.
+          if [ -n "${GOCOVERDIR:-}" ] && systemctl is-active --quiet snap.lxd.daemon.service; then
+            sudo systemctl stop snap.lxd.daemon.service
+          fi
+
       # always update cache as we have our own logic of
       # cache invalidation and updates in addition to a date check
       - name: Delete previous cache
@@ -780,7 +790,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/cache/save@8b402f58fbc84540c8b491a91e594a4576fec3d7 # v5.0.2
+      - uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
         if: ${{ matrix.test == 'qemu-external-vm' }}
         with:
           path: /home/runner/work/cache

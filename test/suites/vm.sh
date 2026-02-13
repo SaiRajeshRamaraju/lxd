@@ -1,13 +1,12 @@
-_secureboot_csm_boot() {
-  echo "==> Secure boot and CSM combinations"
-  # CSM requires secureboot to be disabled.
-  ! lxc launch --vm --empty v1 -c limits.memory=128MiB -d "${SMALL_ROOT_DISK}" --config security.csm=true || false
-  lxc config set v1 security.secureboot=false
+_boot_mode() {
+  echo "==> VM boot mode combinations"
+  lxc launch --vm --empty v1 -c limits.memory=128MiB -d "${SMALL_ROOT_DISK}" --config boot.mode=bios
+  lxc stop -f v1
+
+  lxc config set v1 boot.mode=uefi-nosecureboot
   lxc start v1
   lxc stop -f v1
-  # CSM with secureboot should refuse to start.
-  lxc config set v1 security.secureboot=true
-  ! lxc start v1 || false
+
   lxc delete -f v1
 }
 
@@ -136,11 +135,42 @@ test_vm_pcie_bus() {
   lxc exec v1 -- mount -t virtiofs config /mnt
   ! lxc exec v1 -- touch /mnt/foo || false
 
+  sub_test "Check that limits.max_bus_ports config option enforces the number of allowed PCIe devices"
+
+  # The default value for "limits.max_bus_ports" is 8 ports.
+  # Fill all the available slots with PCIe devices.
+  for i in $(seq 1 5); do
+    lxc config device add v1 "aaa${i}" nic nictype=p2p
+  done
+
+  # Check that another device cannot be hotplugged because no more available PCIe ports left.
+  ! lxc config device add v1 aaa6 nic nictype=p2p || false
+
+  # Stop the VM and attach an additional device.
+  lxc stop -f v1
+  lxc config device add v1 aaa6 nic nictype=p2p
+
+  # Check that the instance start fails because PCIe devices limit is exceeded.
+  ! lxc start v1 || false
+
+  # Increase the PCIe devices limit.
+  lxc config set v1 limits.max_bus_ports=10
+
+  # Start the instance, this time there should enough PCIe ports.
+  lxc start v1
+  waitInstanceReady v1
+
+  # Hotplug an additional device, there should still be one available PCIe port.
+  lxc config device add v1 aaa7 nic nictype=p2p
+
+  # Check that another device cannot be hotplugged because no more available PCIe ports left.
+  ! lxc config device add v1 aaa8 nic nictype=p2p || false
+
   # Coverage data requires clean lxd-agent stop
   prepare_vm_for_hard_stop v1
   lxc delete --force v1
 
-  _secureboot_csm_boot
+  _boot_mode
 
   echo "==> Ephemeral cleanup"
   lxc launch --vm --empty --ephemeral v1 -c limits.memory=128MiB -d "${SMALL_ROOT_DISK}"
@@ -161,6 +191,6 @@ test_vm_pcie_bus() {
 }
 
 test_snap_vm_empty() {
-  # useful to test snap provided CSM BIOS
-  _secureboot_csm_boot
+  # useful to test snap provided BIOS boot
+  _boot_mode
 }

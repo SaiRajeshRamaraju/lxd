@@ -368,6 +368,12 @@ test_clustering_containers() {
   [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc list -f csv -c L bar)" = "node1" ]
   LXD_DIR="${LXD_THREE_DIR}" lxc delete bar
 
+  echo "Copy the container on node2 without specifying a target, using a client connected to non-source node1."
+  LXD_DIR="${LXD_ONE_DIR}" lxc copy foo auto-copy
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c n auto-copy)" = "auto-copy" ]
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c L auto-copy)" != "node2" ]
+  LXD_DIR="${LXD_THREE_DIR}" lxc delete auto-copy
+
   echo "Copy the container on node2 to node3, using a client connected to node1."
   LXD_DIR="${LXD_ONE_DIR}" lxc copy foo bar --target node3
   [ "$(LXD_DIR="${LXD_TWO_DIR}" lxc list -f csv -c L bar)" = "node3" ]
@@ -2292,6 +2298,15 @@ test_clustering_dns() {
 }
 
 test_clustering_fan() {
+  # FAN bridge is not working on Noble+6.14 kernel
+  # https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2141703 and https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2141715
+  if grep -qxF 'VERSION_ID="24.04"' /etc/os-release && runsMinimumKernel 6.14; then
+    local kernel_version
+    kernel_version="$(uname -r)"
+    export TEST_UNMET_REQUIREMENT="Broken FAN bridge on ${kernel_version} kernel"
+    return 0
+  fi
+
   spawn_lxd_and_bootstrap_cluster
 
   local cert
@@ -4476,9 +4491,9 @@ test_clustering_trust_add() {
   sleep 1.1
 
   # Expect one running token operation.
-  operation_uuid="$(LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "TOKEN,Executing operation,RUNNING" | cut -d, -f1 )"
-  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,RUNNING"
-  is_uuid_v4 "${operation_uuid}"
+  operation_uuid="$(LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "TOKEN,Certificate add token,RUNNING" | cut -d, -f1 )"
+  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,RUNNING"
+  is_uuid_v7 "${operation_uuid}"
 
   # Get the address of LXD_TWO.
   lxd_two_address="https://$(LXD_DIR="${LXD_TWO_DIR}" lxc config get core.https_address)"
@@ -4491,8 +4506,8 @@ test_clustering_trust_add() {
   ! lxc remote add lxd_two "${lxd_two_address}" --token "${lxd_one_token}" || false
 
   # Expect the operation to be cancelled.
-  LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,CANCELLED"
-  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,CANCELLED"
+  LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,CANCELLED"
+  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,CANCELLED"
 
   # Set token expiry to 1 hour
   LXD_DIR="${LXD_ONE_DIR}" lxc config set core.remote_token_expiry 1H
@@ -4503,9 +4518,9 @@ test_clustering_trust_add() {
   lxd_one_token="$(LXD_DIR="${LXD_ONE_DIR}" lxc config trust add --name foo --quiet)"
 
   # Expect one running token operation.
-  operation_uuid="$(LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "TOKEN,Executing operation,RUNNING" | cut -d, -f1 )"
-  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,RUNNING"
-  is_uuid_v4 "${operation_uuid}"
+  operation_uuid="$(LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "TOKEN,Certificate add token,RUNNING" | cut -d, -f1 )"
+  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,RUNNING"
+  is_uuid_v7 "${operation_uuid}"
 
   # Test adding the remote using the address of LXD_TWO with the token operation running on LXD_ONE.
   # LXD_TWO does not have the operation running locally, so it should find the UUID of the operation in the database
@@ -4514,8 +4529,8 @@ test_clustering_trust_add() {
   lxc remote add lxd_two "${lxd_two_address}" --token "${lxd_one_token}"
 
   # Expect the operation to be cancelled.
-  LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,CANCELLED"
-  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Executing operation,CANCELLED"
+  LXD_DIR="${LXD_ONE_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,CANCELLED"
+  LXD_DIR="${LXD_TWO_DIR}" lxc operation list --format csv | grep -F "${operation_uuid},TOKEN,Certificate add token,CANCELLED"
 
   # Clean up
   lxc remote rm lxd_two
