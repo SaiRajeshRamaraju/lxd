@@ -7,13 +7,10 @@ import (
 	"net"
 	"net/http"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
-
+	"github.com/canonical/lxd/client"
 	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/cluster"
 	"github.com/canonical/lxd/lxd/db"
@@ -22,6 +19,7 @@ import (
 	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/lxd/response"
+	"github.com/canonical/lxd/lxd/util"
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
@@ -30,16 +28,9 @@ import (
 	"github.com/canonical/lxd/shared/version"
 )
 
-// urlInstanceTypeDetect detects what sort of instance type is being requested. Either
-// implicitly via the endpoint URL used of explicitly via the instance-type query param.
+// urlInstanceTypeDetect detects what sort of instance type is being requested
+// via the instance-type query param.
 func urlInstanceTypeDetect(r *http.Request) (instancetype.Type, error) {
-	routeName := mux.CurrentRoute(r).GetName()
-	if strings.HasPrefix(routeName, "container") {
-		return instancetype.Container, nil
-	} else if strings.HasPrefix(routeName, "vm") {
-		return instancetype.VM, nil
-	}
-
 	reqInstanceType := r.URL.Query().Get("instance-type")
 	if reqInstanceType == "" {
 		return instancetype.Any, nil
@@ -192,6 +183,11 @@ func urlInstanceTypeDetect(r *http.Request) (instancetype.Type, error) {
 //      name: all-projects
 //      description: Retrieve instances from all projects
 //      type: boolean
+//    - in: query
+//      name: recursion
+//      description: Recursion level (0, 1, 2)
+//      type: string
+//      example: 2
 //  responses:
 //    "200":
 //      description: API endpoints
@@ -216,6 +212,8 @@ func urlInstanceTypeDetect(r *http.Request) (instancetype.Type, error) {
 //            description: List of instances
 //            items:
 //              $ref: "#/definitions/InstanceFull"
+//    "400":
+//      $ref: "#/responses/BadRequest"
 //    "403":
 //      $ref: "#/responses/Forbidden"
 //    "500":
@@ -232,10 +230,11 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 		return response.BadRequest(err)
 	}
 
-	// Parse the recursion field.
-	recursion, err := strconv.Atoi(r.FormValue("recursion"))
+	recursion, fields := util.IsRecursionRequest(r)
+
+	stateOpts, err := instance.ParseRecursionFields(fields)
 	if err != nil {
-		recursion = 0
+		return response.BadRequest(err)
 	}
 
 	// Parse filter value.
@@ -461,7 +460,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 							continue
 						}
 
-						c, _, err := inst.RenderFull(hostInterfaces)
+						c, _, err := inst.RenderFull(hostInterfaces, stateOpts)
 						if err != nil {
 							resultErrListAppend(dbInst, err)
 						} else {
@@ -500,16 +499,7 @@ func instancesGet(d *Daemon, r *http.Request) response.Response {
 	if recursion == 0 {
 		resultList := make([]string, 0, len(resultFullList))
 		for i := range resultFullList {
-			instancePath := "instances"
-			routeName := mux.CurrentRoute(r).GetName()
-			switch routeName {
-			case "container":
-				instancePath = "containers"
-			case "vm":
-				instancePath = "virtual-machines"
-			}
-
-			url := api.NewURL().Path(version.APIVersion, instancePath, resultFullList[i].Name).Project(resultFullList[i].Project)
+			url := api.NewURL().Path(version.APIVersion, "instances", resultFullList[i].Name).Project(resultFullList[i].Project)
 			resultList = append(resultList, url.String())
 		}
 
@@ -552,7 +542,10 @@ func doContainersGetFromNode(projects []string, node string, allProjects bool, n
 
 		var containers []api.Instance
 		if allProjects {
-			containers, err = client.GetInstancesAllProjects(api.InstanceType(instanceType.String()))
+			containers, err = client.GetInstances(lxd.GetInstancesArgs{
+				InstanceType: api.InstanceType(instanceType.String()),
+				AllProjects:  true,
+			})
 			if err != nil {
 				return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 			}
@@ -560,7 +553,9 @@ func doContainersGetFromNode(projects []string, node string, allProjects bool, n
 			for _, project := range projects {
 				client = client.UseProject(project)
 
-				tmpContainers, err := client.GetInstances(api.InstanceType(instanceType.String()))
+				tmpContainers, err := client.GetInstances(lxd.GetInstancesArgs{
+					InstanceType: api.InstanceType(instanceType.String()),
+				})
 				if err != nil {
 					return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 				}
@@ -601,7 +596,10 @@ func doContainersFullGetFromNode(projects []string, node string, allProjects boo
 
 		var instances []api.InstanceFull
 		if allProjects {
-			instances, err = client.GetInstancesFullAllProjects(api.InstanceType(instanceType.String()))
+			instances, err = client.GetInstancesFull(lxd.GetInstancesFullArgs{
+				InstanceType: api.InstanceType(instanceType.String()),
+				AllProjects:  true,
+			})
 			if err != nil {
 				return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 			}
@@ -609,7 +607,9 @@ func doContainersFullGetFromNode(projects []string, node string, allProjects boo
 			for _, project := range projects {
 				client = client.UseProject(project)
 
-				tmpInstances, err := client.GetInstancesFull(api.InstanceType(instanceType.String()))
+				tmpInstances, err := client.GetInstancesFull(lxd.GetInstancesFullArgs{
+					InstanceType: api.InstanceType(instanceType.String()),
+				})
 				if err != nil {
 					return nil, fmt.Errorf("Failed to get instances from member %s: %w", node, err)
 				}

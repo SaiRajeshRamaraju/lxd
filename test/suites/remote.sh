@@ -28,7 +28,7 @@ test_remote_url() {
   done
 
   # Check that we can add simplestream remotes with valid certs without confirmation
-  if [ -z "${LXD_OFFLINE:-}" ]; then
+  if curl --head --silent https://cloud-images.ubuntu.com/releases/ > /dev/null; then
     lxc_remote remote add ubuntu1 https://cloud-images.ubuntu.com/releases/ --protocol=simplestreams
     lxc_remote remote add ubuntu2 https://cloud-images.ubuntu.com:443/releases/ --protocol=simplestreams
     lxc_remote remote remove ubuntu1
@@ -166,7 +166,10 @@ test_remote_admin() {
 
   echo "Verify that a bad token does not succeed in adding remote"
   ! lxc_remote remote add badtoken "${LXD_ADDR}" --token badtoken || false
-  ! lxc_remote remote list | grep -wF badtoken || false
+  if lxc_remote remote list | grep -wF badtoken; then
+    echo "Remote added with bad token"
+    false
+  fi
 
   token="$(lxc config trust add --name foo -q)"
 
@@ -180,8 +183,11 @@ test_remote_admin() {
   [ "$(lxc_remote remote get-default)" = "foo" ]
 
   lxc_remote remote rename foo bar
-  lxc_remote remote list | grep 'bar'
-  ! lxc_remote remote list | grep -F 'foo' || false
+  lxc_remote remote list -f csv | grep '^bar'
+  if lxc_remote remote list -f csv | grep '^foo'; then
+    echo "Remote rename failed, old name still exists"
+    false
+  fi
   [ "$(lxc_remote remote get-default)" = "bar" ]
 
   ! lxc_remote remote remove bar || false
@@ -296,14 +302,6 @@ test_remote_usage() {
 
   # testimage should still exist on the local server.
   lxc_remote image list local: | grep -wF testimage
-
-  # Skip the truly remote servers in offline mode.
-  # There should always be Ubuntu images in the results from cloud-images.ubuntu.com remote.
-  # And test for alpine in the images.lxd.canonical.com remote.
-  if [ -z "${LXD_OFFLINE:-}" ]; then
-    lxc_remote image list images: | grep -i -c alpine
-    lxc_remote image list ubuntu: | grep -i -c ubuntu
-  fi
 
   mv "${LXD_CONF}/client.crt.bak" "${LXD_CONF}/client.crt"
   mv "${LXD_CONF}/client.key.bak" "${LXD_CONF}/client.key"

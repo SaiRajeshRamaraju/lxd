@@ -287,6 +287,9 @@ test_clustering_membership() {
 }
 
 test_clustering_containers() {
+  local pool_driver
+  pool_driver="$(storage_backend "${LXD_INITIAL_DIR}")"
+
   echo "Create cluster with 3 nodes."
   spawn_lxd_and_bootstrap_cluster
 
@@ -369,10 +372,64 @@ test_clustering_containers() {
   LXD_DIR="${LXD_THREE_DIR}" lxc delete bar
 
   echo "Copy the container on node2 without specifying a target, using a client connected to non-source node1."
+  # Ensure the source container is on node2
+  [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c L foo)" = "node2" ]
   LXD_DIR="${LXD_ONE_DIR}" lxc copy foo auto-copy
   [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c n auto-copy)" = "auto-copy" ]
   [ "$(LXD_DIR="${LXD_ONE_DIR}" lxc list -f csv -c L auto-copy)" != "node2" ]
   LXD_DIR="${LXD_THREE_DIR}" lxc delete auto-copy
+
+  echo "Refresh a container and check its placement afterwards."
+  # Create stopped base container.
+  LXD_DIR="${LXD_ONE_DIR}" lxc copy foo test-refresh --target node1
+
+  # Create additional target project.
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create foo
+  LXD_DIR="${LXD_ONE_DIR}" lxc profile device add default root disk path="/" pool="data" --project foo
+
+  # Perform copy/refresh matrix test from every cluster member to ensure the request forwards work as expected
+  # and test with both started and stopped containers.
+  for state in "" "--start"; do
+    for project in "default" "foo"; do
+      for member in "node1" "node2" "node3"; do
+        echo "Copy base container to target ${member}."
+        # shellcheck disable=SC2248
+        LXD_DIR="${LXD_ONE_DIR}" lxc copy test-refresh test-refresh-target --target "${member}" --target-project "${project}" ${state}
+
+        echo "Check placement is correct."
+        LXD_DIR="${LXD_ONE_DIR}" lxc info test-refresh-target --project "${project}" | grep -xF "Location: ${member}"
+
+        echo "Refresh target container."
+        if [ "${state}" = "--start" ]; then
+          local expected_error
+
+          echo "Refresh should be blocked if the instance is running."
+
+          # When using a remote driver or when copying on the same member the internal copy is used instead of the migration protocol.
+          if [ "${pool_driver}" != "ceph" ] && [ "${member}" != "node1" ]; then
+            expected_error='Error: Cannot refresh running instance "test-refresh-target"'
+          else
+            expected_error="Error: Failed getting exclusive access to target instance: Instance is running"
+          fi
+
+          [ "$(LXD_DIR="${LXD_ONE_DIR}" CLIENT_DEBUG="" SHELL_TRACING="" lxc copy test-refresh test-refresh-target --refresh --target-project "${project}" 2>&1)" = "${expected_error}" ]
+        else
+          LXD_DIR="${LXD_ONE_DIR}" lxc copy test-refresh test-refresh-target --refresh --target-project "${project}"
+        fi
+
+        echo "Check placement hasn't changed during refresh."
+        LXD_DIR="${LXD_ONE_DIR}" lxc info test-refresh-target --project "${project}" | grep -xF "Location: ${member}"
+
+        echo "Check project hasn't changed during refresh."
+        LXD_DIR="${LXD_ONE_DIR}" lxc info test-refresh-target --project "${project}"
+
+        LXD_DIR="${LXD_ONE_DIR}" lxc delete -f test-refresh-target --project "${project}"
+      done
+    done
+  done
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc delete -f test-refresh
+  LXD_DIR="${LXD_ONE_DIR}" lxc project delete foo
 
   echo "Copy the container on node2 to node3, using a client connected to node1."
   LXD_DIR="${LXD_ONE_DIR}" lxc copy foo bar --target node3
@@ -1501,6 +1558,7 @@ test_clustering_publish() {
   sleep 2
 
   # Init a container on node2, using a client connected to node1
+  sub_test "Test image publishing from instance and snapshot"
   LXD_DIR="${LXD_TWO_DIR}" ensure_import_testimage
   LXD_DIR="${LXD_ONE_DIR}" lxc init --target node2 testimage foo
 
@@ -1511,6 +1569,25 @@ test_clustering_publish() {
   LXD_DIR="${LXD_TWO_DIR}" lxc snapshot foo backup
   LXD_DIR="${LXD_ONE_DIR}" lxc publish foo/backup --alias=foo-backup-image
   LXD_DIR="${LXD_ONE_DIR}" lxc image show foo-backup-image | grep -F "public: false"
+
+  LXD_DIR="${LXD_ONE_DIR}" lxc image delete foo-backup-image
+  LXD_DIR="${LXD_ONE_DIR}" lxc delete foo --force
+
+  sub_test "Test image publishing in project with disabled image feature"
+  project="img-publish-test"
+  LXD_DIR="${LXD_ONE_DIR}" lxc project create "${project}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc project set "${project}" features.images=false
+  LXD_DIR="${LXD_ONE_DIR}" lxc project set "${project}" features.storage.volumes=false
+  LXD_DIR="${LXD_ONE_DIR}" lxc project set "${project}" features.profiles=false
+
+  # Create and publish instance as an image in that project.
+  LXD_DIR="${LXD_ONE_DIR}" lxc init testimage foo --project "${project}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc publish foo --project "${project}" --alias foo-image
+
+  # Cleanup
+  LXD_DIR="${LXD_ONE_DIR}" lxc image delete foo-image --project "${project}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc delete foo --force --project "${project}"
+  LXD_DIR="${LXD_ONE_DIR}" lxc project delete "${project}"
 
   LXD_DIR="${LXD_TWO_DIR}" lxd shutdown
   LXD_DIR="${LXD_ONE_DIR}" lxd shutdown

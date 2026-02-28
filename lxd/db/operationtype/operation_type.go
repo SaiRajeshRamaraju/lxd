@@ -55,14 +55,16 @@ const (
 	SnapshotTransfer
 	SnapshotUpdate
 	SnapshotDelete
+	SnapshotCopy
 	ImageDownload
 	ImageDelete
-	ImageToken
+	ImageDownloadToken
 	ImageRefresh
 	VolumeCopy
 	VolumeCreate
 	VolumeMigrate
 	VolumeMove
+	VolumeSnapshotCopy
 	VolumeSnapshotCreate
 	VolumeSnapshotDelete
 	VolumeSnapshotUpdate
@@ -94,6 +96,14 @@ const (
 	ProfileUpdate
 	VolumeUpdate
 	VolumeDelete
+	ImageUploadToken
+	ImageUpload
+	InstanceCopy
+	VolumeSnapshotsCreateScheduled
+	InstanceStateUpdateBulk
+	VolumeSnapshotTransfer
+	ProjectDelete
+	Wait
 
 	// upperBound is used only to enforce consistency in the package on init.
 	// Make sure it's always the last item in this list.
@@ -128,6 +138,8 @@ func (t Type) Description() string {
 		return "Showing console"
 	case InstanceCreate:
 		return "Creating instance"
+	case InstanceCopy:
+		return "Copying instance"
 	case InstanceUpdate:
 		return "Updating instance"
 	case InstanceRename:
@@ -166,12 +178,16 @@ func (t Type) Description() string {
 		return "Updating snapshot"
 	case SnapshotDelete:
 		return "Deleting snapshot"
+	case SnapshotCopy:
+		return "Copying snapshot"
 	case ImageDownload:
 		return "Downloading image"
 	case ImageDelete:
 		return "Deleting image"
-	case ImageToken:
+	case ImageDownloadToken:
 		return "Image download token"
+	case ImageUploadToken:
+		return "Image upload token"
 	case ImageRefresh:
 		return "Refreshing image"
 	case VolumeCopy:
@@ -186,6 +202,8 @@ func (t Type) Description() string {
 		return "Migrating storage volume"
 	case VolumeMove:
 		return "Moving storage volume"
+	case VolumeSnapshotCopy:
+		return "Copying storage volume snapshot"
 	case VolumeSnapshotCreate:
 		return "Creating storage volume snapshot"
 	case VolumeSnapshotDelete:
@@ -242,6 +260,19 @@ func (t Type) Description() string {
 		return "Certificate add token"
 	case RemoveExpiredOIDCSessions:
 		return "Removing expired OIDC sessions"
+	case ImageUpload:
+		return "Uploading image"
+	case VolumeSnapshotsCreateScheduled:
+		return "Creating scheduled volume snapshots"
+	case InstanceStateUpdateBulk:
+		return "Updating the state of multiple instances"
+	case VolumeSnapshotTransfer:
+		return "Transferring volume snapshot"
+	case ProjectDelete:
+		return "Deleting project"
+	// Wait is just a testing operation spawned by the testing/operation-wait API endpoint
+	case Wait:
+		return "Just chilling"
 
 	// It should never be possible to reach the default clause.
 	// See the init function.
@@ -258,40 +289,45 @@ func (t Type) EntityType() entity.Type {
 		ImagesSynchronize, RemoveExpiredOIDCSessions, RemoveExpiredTokens, RemoveOrphanedOperations,
 		WarningsPruneResolved, ClusterMemberEvacuate, ClusterMemberRestore, LogsExpire, InstanceTypesUpdate,
 		BackupsExpire, SnapshotsExpire, ClusterJoinToken, CertificateAddToken, RenewServerCertificate,
-		ClusterHeal, ImagesUpdate:
+		ClusterHeal, ImagesUpdate, VolumeSnapshotsCreateScheduled:
 		return entity.TypeServer
 
 	// Project level operations.
 	// If creating a resource, then the parent project is the primary entity
 	// (the entity being created is not yet referenceable).
-	case VolumeCreate, ProjectRename, InstanceCreate, ImageDownload:
+	case VolumeCreate, ProjectRename, InstanceCreate, ImageDownload, ImageUploadToken, CustomVolumeBackupRestore,
+		InstanceStateUpdateBulk, BackupRestore, ProjectDelete:
 		return entity.TypeProject
 
 	// Volume operations.
-	case VolumeSnapshotRename, VolumeSnapshotUpdate, VolumeSnapshotDelete, VolumeMigrate,
-		VolumeMove, VolumeSnapshotCreate, CustomVolumeBackupCreate, VolumeCopy, VolumeUpdate, VolumeDelete:
+	case VolumeMigrate, VolumeMove, VolumeSnapshotCreate, CustomVolumeBackupCreate, VolumeCopy, VolumeUpdate, VolumeDelete:
 		return entity.TypeStorageVolume
+
+	// Volume snapshot operations
+	case VolumeSnapshotRename, VolumeSnapshotUpdate, VolumeSnapshotDelete, VolumeSnapshotTransfer, VolumeSnapshotCopy:
+		return entity.TypeStorageVolumeSnapshot
 
 	// Instance operations.
 	case BackupCreate, ConsoleShow, InstanceFreeze, InstanceUpdate, InstanceUnfreeze,
 		InstanceStart, InstanceStop, InstanceRestart, InstanceRename, InstanceMigrate, InstanceLiveMigrate,
-		InstanceDelete, InstanceRebuild, SnapshotRestore, CommandExec, SnapshotCreate:
+		InstanceDelete, InstanceRebuild, SnapshotRestore, CommandExec, SnapshotCreate, InstanceCopy,
+		Wait:
 		return entity.TypeInstance
 
 	// Instance backup operations.
-	case BackupRename, BackupRemove, BackupRestore:
+	case BackupRename, BackupRemove:
 		return entity.TypeInstanceBackup
 
 	// Instance snapshot operations.
-	case SnapshotRename, SnapshotTransfer, SnapshotUpdate, SnapshotDelete:
+	case SnapshotRename, SnapshotTransfer, SnapshotUpdate, SnapshotDelete, SnapshotCopy:
 		return entity.TypeInstanceSnapshot
 
 	// Image operations.
-	case ImageDelete, ImageRefresh, ImageToken:
+	case ImageDelete, ImageRefresh, ImageDownloadToken, ImageUpload:
 		return entity.TypeImage
 
 	// Volume backup operations.
-	case CustomVolumeBackupRemove, CustomVolumeBackupRename, CustomVolumeBackupRestore:
+	case CustomVolumeBackupRemove, CustomVolumeBackupRename:
 		return entity.TypeStorageVolumeBackup
 
 	// Profile operations.
@@ -303,4 +339,24 @@ func (t Type) EntityType() entity.Type {
 	default:
 		return ""
 	}
+}
+
+// ConflictAction returns the action to take if a conflicting operation is already running.
+type ConflictAction int
+
+const (
+	// ConflictActionNone means operation has no conflicts, all operations of this type can run concurrently.
+	ConflictActionNone ConflictAction = iota
+	// ConflictActionFail asks to resolve conflicts by failing to create a new operation if a conflicting operation is already running.
+	ConflictActionFail
+)
+
+// ConflictAction returns the action to take if a conflicting operation is already running.
+func (t Type) ConflictAction() ConflictAction {
+	switch t {
+	case Wait:
+		return ConflictActionFail
+	}
+
+	return ConflictActionNone
 }

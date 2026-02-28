@@ -5,7 +5,8 @@ lxd_websocket_operation() {
   local duration="$2"
   local project_name="${3:-default}"
 
-  lxc query --wait -X POST -d '{"duration": "'"${duration}"'", "op_class": 2, "op_type": 20, "resources": {"instances": ["/1.0/instances/'"${instance_name}"'?project='"${project_name}"'"]}}' "/internal/testing/operation-wait?project=${project_name}"
+  # op_type 20 is "CommandExec"
+  lxc query --wait -X POST -d '{"duration": "'"${duration}"'", "op_class": 2, "op_type": 20, "entity_url": "/1.0/instances/'"${instance_name}"'?project='"${project_name}"'"}' "/internal/testing/operation-wait?project=${project_name}"
 }
 
 # lxd_volume_operation simulates a custom volume operation.
@@ -16,12 +17,15 @@ lxd_volume_operation() {
   local duration="$3"
   local project_name="${4:-default}"
 
-  lxc query --wait -X POST -d '{"duration": "'"${duration}"'", "op_class": 1, "op_type": 48, "resources": {"storage_volumes": ["/1.0/storage-pools/'"${pool_name}"'/volumes/custom/'"${volume_name}"'?project='"${project_name}"'"]}}' "/internal/testing/operation-wait?project=${project_name}"
+  # op_type 32 is "VolumeCopy"
+  lxc query --wait -X POST -d '{"duration": "'"${duration}"'", "op_class": 1, "op_type": 32, "entity_url": "/1.0/storage-pools/'"${pool_name}"'/volumes/custom/'"${volume_name}"'?project='"${project_name}"'"}' "/internal/testing/operation-wait?project=${project_name}"
 }
 
 # check_registered_operations checks for registered operations.
 # It ensures that all the PIDs related to ongoing operations are still running.
 check_registered_operations() {
+  # Sleep for short time to ensure operation has actually started (and not failed to start).
+  sleep 0.1
   local pid
   for pid in "$@"; do
     [ -d "/proc/${pid}" ] || return 1

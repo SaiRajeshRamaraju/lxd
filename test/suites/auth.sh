@@ -204,9 +204,14 @@ effective_groups:
 effective_permissions: []
 fine_grained: true"
 
-  [ "$(LXD_CONF="${LXD_CONF2}" lxc auth identity info tls:)" = "${expectedTLSInfo}" ]
+  # Compare result without certificate expiry, which is non-deterministic.
+  currentIdentity="$(LXD_CONF="${LXD_CONF2}" lxc auth identity info tls:)"
+  [ "$(printf '%s\n' "${currentIdentity}" | sed '/^expires_at: /d')" = "${expectedTLSInfo}" ]
 
-  # Need heredoc to retain double quotes for empty TLS certificate.
+  # Ensure the expiration date in response has valid format ("YYYY-MM-DDThh:mm:ssZ").
+  certExpiresAt="$(printf '%s\n' "${currentIdentity}" | sed -n 's/^expires_at: //p')"
+  [[ "${certExpiresAt}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+
   expectedBearerInfo="authentication_method: bearer
 type: Client token bearer
 id: ${bearer_identity_id}
@@ -222,7 +227,14 @@ fine_grained: true"
   # When bearer token is passed using environment variable, it will take precedence over the OIDC/TLS
   # authentication, however, we need HTTPS remote to get the identity info. We simply reuse the remote
   # used for testing TLS authentication.
-  [ "$(LXD_CONF="${LXD_CONF4}" LXD_AUTH_BEARER_TOKEN="${bearer_identity_token}" lxc auth identity info bearer:)" = "${expectedBearerInfo}" ]
+  currentIdentity="$(LXD_CONF="${LXD_CONF4}" LXD_AUTH_BEARER_TOKEN="${bearer_identity_token}" lxc auth identity info bearer:)"
+
+  # Compare result without token expiry, which is non-deterministic.
+  [ "$(printf '%s\n' "${currentIdentity}" | sed '/^expires_at: /d')" = "${expectedBearerInfo}" ]
+
+  # Ensure the expiration date in response has valid format ("YYYY-MM-DDThh:mm:ssZ").
+  tokenExpiresAt="$(printf '%s\n' "${currentIdentity}" | sed -n 's/^expires_at: //p')"
+  [[ "${tokenExpiresAt}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
 
   # Identity permissions.
   ! lxc auth group permission add test-group identity test-user@example.com can_view || false # Missing authentication method
@@ -436,8 +448,18 @@ fine_grained: true"
   ! lxc query -X PATCH oidc:/1.0/auth/identities/oidc/test-user@example.com -d "{\"tls_certificate\":\"${user6_cert}\"}" || false
   [ "$("${_LXC}" query -X PATCH oidc:/1.0/auth/identities/oidc/test-user@example.com -d "{\"tls_certificate\":\"${user6_cert}\"}" 2>&1 >/dev/null)" = 'Error: Forbidden' ]
 
-  lxc auth identity delete devlxd/test-bearer
+  # Make sure the TLS identity cannot be created from a peer certificate when authenticated using a bearer token.
+  # This can only be performed by the initial UI identity (bearer identities should send a certificate in the request body).
+  lxc auth identity create bearer/tmp
+  lxc auth identity group add bearer/tmp admins
+  LXD_CONF="${TEST_DIR}" gen_cert_and_key "user7"
+  tmp_bearer_identity_token="$(lxc auth identity token issue bearer/tmp --quiet)"
+
+  my_curl -s --cert "${TEST_DIR}/user7.crt" --key "${TEST_DIR}/user7.key" "https://${LXD_ADDR}/1.0/auth/identities/tls" -H "Authorization: Bearer ${tmp_bearer_identity_token}" -d '{"name":"peer-tls-cert", "groups":["admins"]}' | jq -e '.error_code == 400 and .error == "Must provide a certificate"'
+  my_curl -s --cert "${TEST_DIR}/user7.crt" --key "${TEST_DIR}/user7.key" "https://${LXD_ADDR}/1.0" | jq --exit-status '.metadata.auth == "untrusted"'
+
   lxc auth identity delete bearer/test-user
+  lxc auth identity delete bearer/tmp
   lxc auth identity delete tls/bearer-remote-user
   lxc auth identity group add oidc/test-user@example.com test-group
 
@@ -450,7 +472,7 @@ fine_grained: true"
   rm -r "${LXD_CONF3}"
   rm -r "${LXD_CONF4}"
   rm "${TEST_DIR}"/unrestricted.{crt,key}
-  rm "${TEST_DIR}"/user{4,5,6}.{crt,key}
+  rm "${TEST_DIR}"/user{4,5,6,7}.{crt,key}
   lxc config set core.remote_token_expiry="" oidc.issuer="" oidc.client.id=""
   kill_oidc
 }
@@ -756,8 +778,8 @@ user_is_not_server_admin() {
   # Can always see server info (type-bound public access https://openfga.dev/docs/modeling/public-access).
   lxc_remote info "${remote}:" > /dev/null
 
-  # Cannot see any config.
-  ! lxc_remote info "${remote}:" | grep -F 'core.https_address' || false
+  # Cannot get any config.
+  [ "$(lxc_remote config get "${remote}:" core.https_address || echo fail)" = "" ]
 
   # Cannot set any config.
   ! lxc_remote config set "${remote}:" core.proxy_https=https://example.com || false
@@ -1791,4 +1813,133 @@ entities_enrichment_with_entitlements() {
   lxc_remote query "oidc:/1.0?with-access-entitlements=admin,viewer,project_manager" | jq --exit-status '.access_entitlements | sort | @csv == "admin","project_manager","viewer"'
 
   lxc auth group permission remove test-group server admin
+}
+
+test_ui_initial_access_link() {
+  echo "==> Test initial UI access link"
+  lxd init --ui-initial-access-link
+
+  # Regenerate while identity already exists.
+  lxd init --ui-initial-access-link
+
+  # Ensure the identity cannot be edited.
+  ! lxc auth identity edit bearer/ui-admin-initial <<< "groups: []" || false
+
+  # Regenerate after deleting the identity.
+  lxc auth identity delete bearer/ui-admin-initial
+  lxd init --ui-initial-access-link
+
+  # Parse UI access URL and bearer token.
+  output=$(lxd init --ui-initial-access-link)
+  url="https://${output#*https://}"
+  token="${url#*token=}"
+
+  echo "==> Testing initial UI link access"
+  loginOutput=$(curl -s -k -i -H "User-Agent: Mozilla" "${url}")
+
+  if ! grep -q "token_bearer_session=" <<< "${loginOutput}"; then
+    echo "Error: Cookie not set when accessing generated initial UI link"
+    return 1
+  fi
+
+  # Check redirect location
+  if ! grep -i "Location: /ui/" <<< "${loginOutput}"; then
+    echo "Error: Redirect to /ui/ not set when accessing generated initial UI link"
+    return 1
+  fi
+
+  # Extract the cookie value
+  cookie=$(grep -i "set-cookie: token_bearer_session=" <<< "${loginOutput}" | head -n 1 | sed 's/.*token_bearer_session=\([^;]*\).*/\1/')
+  if [ "${cookie}" != "${token}" ]; then
+    echo "Error: Cookie value does not match token"
+    return 1
+  fi
+
+  echo "==> Testing LXD access with cookie"
+  serverInfoOutput=$(curl -s -k -H "User-Agent: Mozilla" -H "Cookie: token_bearer_session=${cookie}" "https://${LXD_ADDR}/1.0")
+
+  # Ensure we are trusted.
+  if ! echo "${serverInfoOutput}" | jq -e '.metadata.auth == "trusted"'; then
+    echo "Error: Client is not trusted when accessing using token_bearer_session cookie"
+    return 1
+  fi
+
+  # Ensure authentication method is bearer.
+  if ! echo "${serverInfoOutput}" | jq -e '.metadata.auth_user_method == "bearer"'; then
+    echo "Error: Auth method is not bearer when accessing using token_bearer_session cookie"
+    return 1
+  fi
+
+  echo "==> Testing current identity information"
+  currentIdentityOutput=$(curl -s -k -H "User-Agent: Mozilla" -H "Cookie: token_bearer_session=${cookie}" "https://${LXD_ADDR}/1.0/auth/identities/current")
+
+  if ! echo "${currentIdentityOutput}" | jq -e '.metadata.authentication_method == "bearer"'; then
+    echo "Error: Current identity information does not include correct token"
+    return 1
+  fi
+
+  # Ensure token expiry date is set.
+  if ! echo "${currentIdentityOutput}" | jq -e '.metadata.expires_at? != null'; then
+    echo "Error: LXD info should include bearer token expiration date"
+    return 1
+  fi
+
+  echo "==> Testing TLS identity creation from initial UI identity peer certificate"
+  LXD_CONF="${TEST_DIR}" gen_cert_and_key "initial-tls-user"
+  curl --silent --insecure -X "POST" \
+    -H "User-Agent: Mozilla" \
+    -H "Cookie: token_bearer_session=${cookie}" \
+    -H "Content-Type: application/json" \
+    -H "Content-Length: 52" \
+    -d '{"name":"initial-tls-user", "groups":["admins"]}' \
+    --cert "${TEST_DIR}/initial-tls-user.crt" \
+    --key "${TEST_DIR}/initial-tls-user.key" \
+    "https://${LXD_ADDR}/1.0/auth/identities/tls"
+  info=$(curl --silent --insecure --cert "${TEST_DIR}/initial-tls-user.crt" --key "${TEST_DIR}/initial-tls-user.key" "https://${LXD_ADDR}/1.0")
+  echo "${info}" | jq --exit-status '.metadata.auth == "trusted"'
+  echo "${info}" | jq --exit-status '.metadata.auth_user_method == "tls"'
+
+  echo "==> Testing bearer logout"
+  logoutOutput=$(curl -s -k -i -H "Cookie: token_bearer_session=${cookie}" "https://${LXD_ADDR}/bearer/logout")
+
+  # Ensure bearer logout redirects to the UI login page.
+  if ! grep -i "Location: /ui/login" <<< "${logoutOutput}"; then
+    echo "Error: Redirect to /ui/login not found on logout"
+    return 1
+  fi
+
+  # Ensure an empty cookie is set on logout.
+  if ! grep -i "set-cookie: token_bearer_session=;" <<< "${logoutOutput}"; then
+    echo "Error: Cookie not cleared on logout"
+    return 1
+  fi
+
+  # Ensure cookie max-age is set to 0 on logout.
+  if ! grep -i "Max-Age=0" <<< "${logoutOutput}"; then
+    echo "Error: Cookie Max-Age not set to 0 on logout"
+    return 1
+  fi
+
+  echo "==> Testing revoked token access"
+  lxc auth identity token revoke bearer/ui-admin-initial
+  loginOutput=$(curl -s -k -i -H "User-Agent: Mozilla" "${url}")
+
+  if grep -q "token_bearer_session=" <<< "${loginOutput}"; then
+    echo "Error: Cookie set when accessing generated initial UI link with invalid token"
+    return 1
+  fi
+
+  # Despite invalid token, LXD should still redirect to the UI, but it should set a query parameter to indicate the failure.
+  if ! grep -i "Location: /ui/?initial-access-link-invalid" <<< "${loginOutput}"; then
+    echo "Error: Redirect to /ui/ not set when accessing generated initial UI link"
+    return 1
+  fi
+
+  # Ensure access is forbidden when using the revoked token.
+  curl -s -k -H "User-Agent: Mozilla" -H "Cookie: token_bearer_session=${cookie}" "https://${LXD_ADDR}/1.0/auth/identities/current" | jq -e '.error_code == 403'
+
+  # Cleanup.
+  lxc auth identity delete bearer/ui-admin-initial
+  lxc auth identity delete tls/initial-tls-user
+  rm "${TEST_DIR}"/initial-tls-user.{crt,key}
 }

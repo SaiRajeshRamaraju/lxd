@@ -41,8 +41,37 @@ test_tls_restrictions() {
 
   # Confirm we cannot view storage pool configuration
   pool_name="$(lxc_remote storage list localhost: --format csv | cut -d, -f1)"
-  ! lxc_remote storage show "localhost:${pool_name}" | grep -F 'source:' || false
+  lxc_remote storage show "localhost:${pool_name}" | yq --exit-status '.config | length == 0'
 
+  sub_test "Verify restricted client cannot see other certificates"
+  # Add a second (admin) certificate that the restricted client should not be able to see.
+  gen_cert_and_key "other-admin"
+  lxc config trust add "${LXD_CONF}/other-admin.crt"
+  OTHER_ADMIN_FINGERPRINT="$(cert_fingerprint "${LXD_CONF}/other-admin.crt")"
+
+  # The admin can see both certificates (non-recursive and recursive).
+  lxc query /1.0/certificates | jq --exit-status 'length == 2'
+  lxc query /1.0/certificates?recursion=1 | jq --exit-status 'length == 2'
+
+  # The restricted client should only see its own certificate in both non-recursive and recursive modes.
+  lxc_remote query localhost:/1.0/certificates | jq --exit-status 'length == 1'
+  lxc_remote query localhost:/1.0/certificates | jq --exit-status '.[0]' | grep -F "${FINGERPRINT}"
+
+  lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status 'length == 1'
+  lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status '.[0].fingerprint' | grep -F "${FINGERPRINT}"
+
+  # The number of results in non-recursive and recursive modes must match (both are filtered).
+  non_recursive_count="$(lxc_remote query localhost:/1.0/certificates | jq --exit-status 'length')"
+  recursive_count="$(lxc_remote query localhost:/1.0/certificates?recursion=1 | jq --exit-status 'length')"
+  [ "${non_recursive_count}" = "${recursive_count}" ]
+
+  # The restricted client should not be able to view the other admin certificate directly.
+  ! lxc_remote query "localhost:/1.0/certificates/${OTHER_ADMIN_FINGERPRINT}" || false
+
+  # Clean up the extra admin certificate.
+  lxc config trust remove "${OTHER_ADMIN_FINGERPRINT}"
+
+  sub_test "Verify restricted client only sees events for allowed projects"
   # Allow access to project blah
   lxc config trust show "${FINGERPRINT}" | sed -e "s/projects: \[\]/projects: ['blah']/" -e "s/restricted: false/restricted: true/" | lxc config trust edit "${FINGERPRINT}"
 
@@ -79,15 +108,19 @@ test_tls_restrictions() {
   rm "${monfile_root}"
 
   # The restricted caller is able to list operations for all projects, but this is filtered to only show operations they have access to.
+  lxc init --empty foo
+  lxc init --empty bar -s"${pool_name}" --project blah
   lxd_websocket_operation foo 1s &
   lxd_websocket_operation bar 1s blah &
   sleep 0.1
   [ "$(lxc operation list --all-projects -f csv | grep -Ec ',WEBSOCKET,Executing command,(PENDING|RUNNING),')" = 2 ] # Two exec operations exist
   [ "$(lxc_remote operation list localhost: --all-projects -f csv | grep -Ec ',WEBSOCKET,Executing command,(PENDING|RUNNING),')" = 1 ] # Restricted caller can only view the one in project blah
 
+  lxc delete foo
+  lxc delete bar --project blah
+
   # Validate restricted view
-  ! lxc_remote project list localhost: | grep -wF default || false
-  lxc_remote project list localhost: | grep -wF blah
+  lxc_remote project list -f json localhost: | jq --exit-status 'map(.name) == ["blah"]'
 
   # Validate that the restricted caller cannot edit or delete the project.
   ! lxc_remote project set localhost:blah user.foo=bar || false

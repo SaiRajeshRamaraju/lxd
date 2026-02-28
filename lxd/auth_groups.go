@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -160,7 +161,7 @@ func validateGroupName(name string) error {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func getAuthGroups(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	canViewGroup, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeAuthGroup)
@@ -205,7 +206,7 @@ func getAuthGroups(d *Daemon, r *http.Request) response.Response {
 			return nil
 		}
 
-		if recursion {
+		if recursion > 0 {
 			// If recursing, we need all identities for all groups, all IDP groups for all groups,
 			// all permissions for all groups, and finally the URLs that those permissions apply to.
 			groupsIdentities, err = dbCluster.GetAllIdentitiesByAuthGroupIDs(ctx, tx.Tx())
@@ -236,7 +237,7 @@ func getAuthGroups(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if recursion {
+	if recursion > 0 {
 		authGroupPermissionsByGroupID := make(map[int][]dbCluster.Permission, len(groups))
 		for _, permission := range authGroupPermissions {
 			authGroupPermissionsByGroupID[permission.GroupID] = append(authGroupPermissionsByGroupID[permission.GroupID], permission)
@@ -498,6 +499,10 @@ func updateAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be modified"))
+	}
+
 	var groupPut api.AuthGroupPut
 	err = json.NewDecoder(r.Body).Decode(&groupPut)
 	if err != nil {
@@ -592,6 +597,10 @@ func patchAuthGroup(d *Daemon, r *http.Request) response.Response {
 	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be modified"))
 	}
 
 	var groupPut api.AuthGroupPut
@@ -704,6 +713,10 @@ func renameAuthGroup(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be renamed"))
+	}
+
 	var groupPost api.AuthGroupPost
 	err = json.NewDecoder(r.Body).Decode(&groupPost)
 	if err != nil {
@@ -756,6 +769,10 @@ func deleteAuthGroup(d *Daemon, r *http.Request) response.Response {
 	groupName, err := url.PathUnescape(mux.Vars(r)["groupName"])
 	if err != nil {
 		return response.SmartError(err)
+	}
+
+	if groupName == api.AuthGroupAdminsName {
+		return response.BadRequest(errors.New("The admins group cannot be deleted"))
 	}
 
 	s := d.State()

@@ -7,7 +7,7 @@ GOPATH ?= $(shell go env GOPATH)
 CGO_LDFLAGS_ALLOW ?= (-Wl,-wrap,pthread_create)|(-Wl,-z,now)
 SPHINXENV=doc/.sphinx/venv/bin/activate
 SPHINXPIPPATH=doc/.sphinx/venv/bin/pip
-GOMIN=1.25.6
+GOMIN=1.25.7
 GOTOOLCHAIN=local
 export GOTOOLCHAIN
 GOCOVERDIR ?= $(shell go env GOCOVERDIR)
@@ -100,6 +100,11 @@ fuidshift:
 	CGO_ENABLED=1 go install -v -trimpath -buildvcs=false $(COVER) ./fuidshift
 	@echo "$@ built successfully"
 
+.PHONY: mini-loki
+mini-loki:
+	go install -C test -v -trimpath -buildvcs=false $(COVER) ./mini-loki
+	@echo "$@ built successfully"
+
 .PHONY: mini-oidc
 mini-oidc:
 	go install -C test -v -trimpath -buildvcs=false $(COVER) ./mini-oidc
@@ -111,7 +116,7 @@ sysinfo:
 	@echo "$@ built successfully"
 
 .PHONY: test-binaries
-test-binaries: devlxd-client lxd-client fuidshift mini-oidc sysinfo
+test-binaries: devlxd-client lxd-client fuidshift mini-loki mini-oidc sysinfo
 	@echo "$@ built successfully"
 
 .PHONY: dqlite
@@ -219,6 +224,10 @@ check-gomin:
 		echo "Error: go.mod Go version is not $(GOMIN)"; \
 		exit 1; \
 	fi
+	@if ! grep -qxF "go $(GOMIN)" tools/go.mod; then \
+		echo "Error: tools/go.mod Go version is not $(GOMIN)"; \
+		exit 1; \
+	fi
 	@echo "Check the doc mentions the right Go minimum version"
 	$(eval DOC_GOMIN := $(shell sed -n 's/^LXD requires Go \([0-9.]\+\) .*/\1/p' doc/requirements.md))
 	if [ "$(DOC_GOMIN)" != "$(GOMIN)" ]; then \
@@ -252,32 +261,27 @@ endif
 	@# Update GOMIN in Makefile
 	sed -i 's/^GOMIN=[0-9.]\+/GOMIN=$(NEW_GOMIN)/' Makefile
 
-	@# Update GOMIN in go.mod
-	sed -i 's/^go [0-9.]\+$$/go $(NEW_GOMIN)/' go.mod
+	@# Update GOMIN in go.mod and tools/go.mod
+	sed -i 's/^go [0-9.]\+$$/go $(NEW_GOMIN)/' go.mod tools/go.mod
 
 	@# Update doc/requirements.md and .github/copilot-instructions.md
 	sed -i 's/^\(LXD requires Go \)[0-9.]\+ /\1$(NEW_GOMIN) /' doc/requirements.md .github/copilot-instructions.md
 
 	@echo "Go minimum version updated to $(NEW_GOMIN)"
-	@./scripts/check-and-commit.sh "Makefile go.mod doc/requirements.md .github/copilot-instructions.md" "go: Update Go minimum version to $(NEW_GOMIN)"
+	@./scripts/check-and-commit.sh "Makefile go.mod tools/go.mod doc/requirements.md .github/copilot-instructions.md" "go: Update Go minimum version to $(NEW_GOMIN)"
 
 .PHONY: update-gomod
 update-gomod:
-ifneq "$(LXD_OFFLINE)" ""
-	@echo "The update-gomod target cannot be run in offline mode."
-	exit 1
-endif
 	# Update gomod dependencies
 	go get -t -v -u ./...
 
 	# Static pins
 	go get github.com/gorilla/websocket@v1.5.1 # Due to riscv64 crashes in LP
-	go get github.com/opencontainers/runtime-spec@v1.2.1 # Due to incompat with nvidia-container-toolkit
 	go get github.com/olekukonko/tablewriter@v0.0.5 # Due to breaking API in later versions
-	go get tags.cncf.io/container-device-interface/specs-go@v1.0.0 # Due to compilation issue
 
 	# Enforce minimum go version
 	go mod tidy -go=$(GOMIN)
+	go mod -C tools tidy -go=$(GOMIN)
 	$(MAKE) check-gomin
 
 	# Use the bundled toolchain that meets the minimum go version
@@ -287,7 +291,7 @@ endif
 	@./scripts/licenses.sh
 
 	@echo "Dependencies updated"
-	@./scripts/check-and-commit.sh "go.mod go.sum" "go: Update dependencies"
+	@./scripts/check-and-commit.sh "go.mod go.sum tools/go.mod tools/go.sum" "go: Update dependencies"
 
 .PHONY: update-protobuf
 update-protobuf:
@@ -311,9 +315,7 @@ check-schema: update-schema
 
 .PHONY: update-api
 update-api:
-ifeq "$(LXD_OFFLINE)" ""
 	go install github.com/go-swagger/go-swagger/cmd/swagger@latest
-endif
 	@# Generate spec and exclude package from dependency which causes a 'classifier: unknown swagger annotation "extendee"' error.
 	@# For more details see: https://github.com/go-swagger/go-swagger/issues/2917.
 	swagger generate spec -o doc/rest-api.yaml -w ./lxd -m -x github.com/grpc-ecosystem/grpc-gateway/v2/protoc-gen-openapiv2/options
@@ -376,7 +378,8 @@ dist:
 	# Create build dir
 	$(eval TMP := $(shell mktemp -d))
 	$(eval COMMIT_HASH := $(shell git rev-parse HEAD))
-	git archive --prefix=lxd-$(VERSION)/ $(COMMIT_HASH) | tar -x -C $(TMP)
+	# Export the source code at the current commit, excluding irrelevant files and directories
+	git archive --prefix=lxd-$(VERSION)/ $(COMMIT_HASH) | tar -x -C $(TMP) --exclude=.gitignore --exclude=.github --exclude=grafana --exclude=tools
 	echo $(COMMIT_HASH) > $(TMP)/lxd-$(VERSION)/.gitref
 
 	# Download dependencies
@@ -422,16 +425,11 @@ dist:
 
 .PHONY: static-analysis
 static-analysis: check-api check-auth check-metadata
-ifeq "$(LXD_OFFLINE)" ""
 	@# XXX: if errortype becomes available as a golangci-lint linter, remove this and update golangci-lint config
 	go install fillmore-labs.com/errortype@latest
 
 	@# XXX: if zerolint becomes available as a golangci-lint linter, remove this and update golangci-lint config
 	go install fillmore-labs.com/zerolint@latest
-endif
-ifeq ($(shell command -v golangci-lint),)
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin
-endif
 ifneq ($(shell command -v yamllint),)
 	yamllint .github/workflows/*.yml
 endif

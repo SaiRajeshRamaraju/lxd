@@ -2928,8 +2928,43 @@ The new setting accepts:
 Adds new identity type `bearer` that allows authentication with the LXD API using bearer tokens.
 See {ref}`LXD bearer tokens <authentication-bearer>`.
 
+If applicable, the endpoint `/1.0/auth/identities/current` now also exposes the credential expiration time.
+The `expires_at` field is set when the current identity is trusted and the authentication method is either `bearer` or `tls`.
+In these cases, it reports the expiration time of the bearer token or the TLS certificate, respectively.
+
 (extension-vm-limits-max-bus-ports)=
 ## `vm_limits_max_bus_ports`
 
 This introduces support for the {config:option}`instance-resource-limits:limits.max_bus_ports` configuration key for virtual machines. This option controls the maximum allowed number of user configurable devices requiring a dedicated PCI/PCIe port for a virtual machine.
 This number includes both the devices attached before the instance start and the devices hotplugged at runtime.
+
+(extension-instances-state-selective-recursion)=
+## `instances_state_selective_recursion`
+
+Adds support for selective recursion when querying instances.
+
+The API now supports selective state field fetching using semicolon-separated syntax in the `recursion` parameter:
+
+* `recursion=2;fields=state.disk` - Fetch only disk information
+* `recursion=2;fields=state.network` - Fetch only network information
+* `recursion=2;fields=state.disk,state.network` - Fetch both disk and network
+* `recursion=2;fields=` - Fetch no expensive state fields (disk and network skipped)
+* `recursion=2` - Fetch all fields (default behavior)
+
+The semicolon and equals signs must be URL-encoded when used in HTTP requests (`%3B` for `;` and `%3D` for `=`).
+
+The `lxc list` command automatically optimizes queries based on requested columns.
+
+(extension-project-delete-operation)=
+## `project_delete_operation`
+
+The {ref}`forced project deletion <extension-projects-force-delete>` API extension added support for forcibly deleting a project and all of its contents.
+This can take a long time, but the `DELETE /1.0/projects/{name}` endpoint still returned a synchronous response.
+
+This extension converts this endpoint to an asynchronous operation response.
+As with the {ref}`storage and profile operation extension <extension-storage-and-profile-operations>`, this extension is forward compatible only.
+
+(extension-gpu-cdi-amd)=
+## `gpu_cdi_amd`
+
+Adds support for using the Container Device Interface (CDI) specification to configure AMD GPU passthrough in LXD containers. The `id` field of GPU devices now accepts CDI identifiers (for example, `amd.com/gpu=gpu{INDEX}`) for containers, in addition to DRM card IDs.

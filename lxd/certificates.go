@@ -137,7 +137,7 @@ var certificateCmd = APIEndpoint{
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func certificatesGet(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	userHasPermission, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeCertificate)
@@ -151,10 +151,10 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 	}
 
 	var certResponses []*api.Certificate
-	var baseCerts []dbCluster.Certificate
+	var certURLs []string
 	urlToCertificate := make(map[*api.URL]auth.EntitlementReporter)
 	err = d.State().DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		baseCerts, err = dbCluster.GetCertificates(ctx, tx.Tx())
+		baseCerts, err := dbCluster.GetCertificates(ctx, tx.Tx())
 		if err != nil {
 			return err
 		}
@@ -165,7 +165,7 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 				continue
 			}
 
-			if recursion {
+			if recursion > 0 {
 				apiCert, err := baseCert.ToAPI(ctx, tx.Tx())
 				if err != nil {
 					return err
@@ -173,6 +173,8 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 
 				certResponses = append(certResponses, apiCert)
 				urlToCertificate[entity.CertificateURL(apiCert.Fingerprint)] = apiCert
+			} else {
+				certURLs = append(certURLs, api.NewURL().Path(version.APIVersion, "certificates", baseCert.Fingerprint).String())
 			}
 		}
 
@@ -182,14 +184,8 @@ func certificatesGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if !recursion {
-		body := []string{}
-		for _, baseCert := range baseCerts {
-			certificateURL := api.NewURL().Path(version.APIVersion, "certificates", baseCert.Fingerprint).String()
-			body = append(body, certificateURL)
-		}
-
-		return response.SyncResponse(true, body)
+	if recursion == 0 {
+		return response.SyncResponse(true, certURLs)
 	}
 
 	if len(withEntitlements) > 0 {
@@ -214,10 +210,6 @@ func clusterMemberJoinTokenValid(s *state.State, r *http.Request, joinToken *api
 	for _, op := range ops {
 		if op.StatusCode != api.Running {
 			continue // Tokens are single use, so if cancelled but not deleted yet its not available.
-		}
-
-		if op.Resources == nil {
-			continue
 		}
 
 		opSecret, ok := op.Metadata["secret"]
@@ -656,7 +648,7 @@ func certificatesPost(d *Daemon, r *http.Request) response.Response {
 			Metadata:    meta,
 		}
 
-		op, err := operations.CreateUserOperation(s, requestor, args)
+		op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 		if err != nil {
 			return response.InternalError(err)
 		}

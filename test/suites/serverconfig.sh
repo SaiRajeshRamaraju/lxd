@@ -61,8 +61,8 @@ _server_config_access() {
   # test untrusted server GET
   ! my_curl "https://$(< "${LXD_ADDR}")/1.0" | grep -wF "environment" || false
 
-  # test authentication type, only tls is enabled by default
-  curl --silent --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq --exit-status '.metadata.auth_methods | .[] == "tls"'
+  # test authentication type, only tls and bearer are enabled by default
+  curl --silent --unix-socket "$LXD_DIR/unix.socket" "lxd/1.0" | jq --exit-status '.metadata.auth_methods == ["tls","bearer"]'
 
   # test fetch metadata validation.
   [ "$(curl --silent --unix-socket "$LXD_DIR/unix.socket" -w "%{http_code}" -o /dev/null -H 'Sec-Fetch-Site: same-origin' "lxd/1.0")" = "200" ]
@@ -95,7 +95,7 @@ _server_config_storage() {
   pool="lxdtest-$(basename "${LXD_DIR}")"
 
   lxc init testimage foo
-  lxc query --wait /1.0/containers/foo/backups -X POST -d '{"expires_at": "2100-01-01T10:00:00-05:00"}'
+  lxc query --wait /1.0/instances/foo/backups -X POST -d '{"expires_at": "2100-01-01T10:00:00-05:00"}'
 
   # Record before
   BACKUPS_BEFORE=$(cd "${LXD_DIR}/backups/" && find . | sort)

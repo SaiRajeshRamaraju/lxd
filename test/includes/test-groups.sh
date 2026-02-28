@@ -83,6 +83,7 @@ readonly test_group_instance=(
 
 readonly test_group_image=(
     "image_acl"
+    "image_architectures"
     "image_auto_update"
     "image_expiry"
     "image_import_dir"
@@ -122,6 +123,7 @@ readonly test_group_standalone=(
     "alias"
     "apparmor"
     "authorization"
+    "ui_initial_access_link"
     "basic_usage"
     "basic_version"
     "certificate_edit"
@@ -136,7 +138,10 @@ readonly test_group_standalone=(
     "fdleak"
     "filtering"
     "get_operations"
+    "operations_conflict_reference"
+    "instances_selective_recursion"
     "kernel_limits"
+    "loki"
     "lxd_user"
     "metrics"
     "oidc"

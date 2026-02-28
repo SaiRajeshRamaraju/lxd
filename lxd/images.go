@@ -58,6 +58,7 @@ import (
 	"github.com/canonical/lxd/shared/ioprogress"
 	"github.com/canonical/lxd/shared/logger"
 	"github.com/canonical/lxd/shared/osarch"
+	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -304,6 +305,11 @@ func compressFile(compress string, infile io.Reader, outfile io.Writer) error {
 		return err
 	}
 
+	err = validate.IsCompressionAlgorithm(fields[0])
+	if err != nil {
+		return err
+	}
+
 	if fields[0] == "squashfs" {
 		// 'tar2sqfs' do not support writing to stdout. So write to a temporary
 		//  file first and then replay the compressed content to outfile.
@@ -442,10 +448,7 @@ func imgPostInstanceInfo(s *state.State, req api.ImagesPost, op *operations.Oper
 					processed = value
 				}
 
-				metadata := make(map[string]any)
-				shared.SetProgressMetadata(metadata, "create_image_from_instance_pack", "Image pack", percent, processed, speed)
-				// Replace metadata to show only current progress, avoiding stale keys from previous stages.
-				_ = op.UpdateMetadata(metadata)
+				_ = op.UpdateProgress("create_image_from_instance_pack", "Image pack", percent, processed, speed)
 			},
 			Length: totalSize,
 		},
@@ -506,10 +509,7 @@ func imgPostInstanceInfo(s *state.State, req api.ImagesPost, op *operations.Oper
 	// Tracker instance for the export phase.
 	tracker := &ioprogress.ProgressTracker{
 		Handler: func(value, speed int64) {
-			metadata := make(map[string]any)
-			shared.SetProgressMetadata(metadata, "create_image_from_instance_pack", "Exporting", value, 0, 0)
-			// Replace metadata to show only current progress, avoiding stale keys from previous stages.
-			_ = op.UpdateMetadata(metadata)
+			_ = op.UpdateProgress("create_image_from_instance_pack", "Exporting", value, 0, 0)
 		},
 	}
 
@@ -1204,7 +1204,7 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	// We need to invalidate the secret whether the source is trusted or not.
-	op, err := imageValidSecret(s, r, dbProject.Name, fingerprint, secret)
+	op, err := imageValidSecret(s, r, dbProject.Name, fingerprint, secret, operationtype.ImageUploadToken)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -1292,16 +1292,23 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 			"public":     req.Public,
 		}
 
-		return createTokenResponse(s, r, dbProject.Name, req.Source.Fingerprint, metadata)
+		return createImageTokenResponse(s, r, dbProject.Name, req.Source.Fingerprint, metadata, operationtype.ImageUploadToken)
 	}
 
-	if !imageUpload && !slices.Contains([]string{"container", "instance", "virtual-machine", "snapshot", "image", "url"}, req.Source.Type) {
+	if !imageUpload && !slices.Contains([]api.SourceType{"container", "instance", "virtual-machine", "snapshot", "image", "url"}, req.Source.Type) {
 		cleanup(builddir, post)
 		return response.InternalError(errors.New("Invalid images JSON"))
 	}
 
+	if req.CompressionAlgorithm != "" {
+		err = validate.IsCompressionAlgorithm(req.CompressionAlgorithm)
+		if err != nil {
+			return response.BadRequest(err)
+		}
+	}
+
 	// Forward requests for containers on other nodes.
-	if !imageUpload && slices.Contains([]string{"container", "instance", "virtual-machine", "snapshot"}, req.Source.Type) {
+	if !imageUpload && slices.Contains([]api.SourceType{"container", "instance", "virtual-machine", "snapshot"}, req.Source.Type) {
 		name := req.Source.Name
 		if name != "" {
 			_, err = post.Seek(0, io.SeekStart)
@@ -1461,13 +1468,14 @@ func imagesPost(d *Daemon, r *http.Request) response.Response {
 
 	args := operations.OperationArgs{
 		ProjectName: dbProject.Name,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "projects", dbProject.Name),
 		Type:        operationtype.ImageDownload,
 		Class:       operations.OperationClassTask,
 		Metadata:    metadata,
 		RunHook:     run,
 	}
 
-	imageOp, err := operations.CreateUserOperation(s, requestor, args)
+	imageOp, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		cleanup(builddir, post)
 		return response.InternalError(err)
@@ -1899,7 +1907,7 @@ func doImagesGet(ctx context.Context, tx *db.ClusterTx, recursion bool, projectN
 func imagesGet(d *Daemon, r *http.Request) response.Response {
 	filterStr := r.FormValue("filter")
 
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 	withEntitlements, err := extractEntitlementsFromQuery(r, entity.TypeImage, true)
 	if err != nil {
 		return response.SmartError(err)
@@ -1955,7 +1963,7 @@ func imagesGet(d *Daemon, r *http.Request) response.Response {
 
 	var result any
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
-		result, err = doImagesGet(ctx, tx, recursion, projectName, publicOnly, clauses, canViewImage, allProjects)
+		result, err = doImagesGet(ctx, tx, recursion > 0, projectName, publicOnly, clauses, canViewImage, allProjects)
 		if err != nil {
 			return err
 		}
@@ -2004,7 +2012,7 @@ func autoUpdateImagesTask(stateFunc func() *state.State) (task.Func, task.Schedu
 			RunHook: opRun,
 		}
 
-		op, err := operations.CreateServerOperation(s, args)
+		op, err := operations.ScheduleServerOperation(s, args)
 		if err != nil {
 			logger.Error("Failed creating image update operation", logger.Ctx{"err": err})
 			return
@@ -2613,7 +2621,7 @@ func pruneExpiredImagesTask(stateFunc func() *state.State) (task.Func, task.Sche
 			RunHook: opRun,
 		}
 
-		op, err := operations.CreateServerOperation(s, args)
+		op, err := operations.ScheduleServerOperation(s, args)
 		if err != nil {
 			logger.Error("Failed creating expired image prune operation", logger.Ctx{"err": err})
 			return
@@ -2763,7 +2771,7 @@ func pruneLeftoverImages(s *state.State) {
 		RunHook: opRun,
 	}
 
-	op, err := operations.CreateServerOperation(s, args)
+	op, err := operations.ScheduleServerOperation(s, args)
 	if err != nil {
 		logger.Error("Failed creating leftover image clean up operation", logger.Ctx{"err": err})
 		return
@@ -2994,12 +3002,21 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 
 	projectName := request.ProjectParam(r)
 
+	effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	details, err := request.GetContextValue[imageDetails](r.Context(), ctxImageDetails)
 	if err != nil {
 		return response.SmartError(err)
 	}
 
-	op, err := doImageDelete(r.Context(), s, details.image.Fingerprint, details.imageID, projectName)
+	var opCreator operations.OperationScheduler = func(s *state.State, args operations.OperationArgs) (*operations.Operation, error) {
+		return operations.ScheduleUserOperationFromRequest(s, r, args)
+	}
+
+	op, err := doImageDelete(r.Context(), opCreator, s, details.image.Fingerprint, details.imageID, projectName, effectiveProjectName)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -3008,7 +3025,7 @@ func imageDelete(d *Daemon, r *http.Request) response.Response {
 }
 
 // doImageDelete deletes an image with the given fingerprint and imageID in the given project.
-func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imageID int, projectName string) (*operations.Operation, error) {
+func doImageDelete(ctx context.Context, opCreator operations.OperationScheduler, s *state.State, fingerprint string, imageID int, requestProjectName string, effectiveProjectName string) (*operations.Operation, error) {
 	requestor, err := request.GetRequestor(ctx)
 	if err != nil {
 		return nil, err
@@ -3030,7 +3047,7 @@ func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imag
 		err = s.DB.Cluster.Transaction(ctx, func(ctx context.Context, tx *db.ClusterTx) error {
 			// Check image still exists and another request hasn't removed it since we resolved the image
 			// fingerprint above.
-			exist, err = tx.ImageExists(ctx, projectName, fingerprint)
+			exist, err = tx.ImageExists(ctx, requestProjectName, fingerprint)
 
 			return err
 		})
@@ -3056,9 +3073,9 @@ func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imag
 				}
 
 				// See if any other project with this image has the same storage volume
-				projectImagesVolume := s.LocalConfig.StorageImagesVolume(projectName)
+				projectImagesVolume := s.LocalConfig.StorageImagesVolume(requestProjectName)
 				for _, project := range projects {
-					if project == projectName {
+					if project == requestProjectName {
 						continue
 					}
 
@@ -3092,7 +3109,7 @@ func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imag
 			}
 
 			err = notifier(func(member db.NodeInfo, client lxd.InstanceServer) error {
-				op, err := client.UseProject(projectName).DeleteImage(fingerprint)
+				op, err := client.UseProject(requestProjectName).DeleteImage(fingerprint)
 				if err != nil {
 					return fmt.Errorf("Failed to request to delete image from peer node: %w", err)
 				}
@@ -3146,7 +3163,7 @@ func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imag
 		}
 
 		// Remove main image file from disk.
-		err = imageDeleteFromDisk(s.LocalConfig.StorageImagesVolume(projectName), fingerprint)
+		err = imageDeleteFromDisk(s.LocalConfig.StorageImagesVolume(requestProjectName), fingerprint)
 		if err != nil {
 			return err
 		}
@@ -3161,23 +3178,20 @@ func doImageDelete(ctx context.Context, s *state.State, fingerprint string, imag
 			}
 		}
 
-		s.Events.SendLifecycle(projectName, lifecycle.ImageDeleted.Event(fingerprint, projectName, op.EventLifecycleRequestor(), nil))
+		s.Events.SendLifecycle(requestProjectName, lifecycle.ImageDeleted.Event(fingerprint, requestProjectName, op.EventLifecycleRequestor(), nil))
 
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["images"] = []api.URL{*api.NewURL().Path(version.APIVersion, "images", fingerprint)}
-
 	args := operations.OperationArgs{
-		ProjectName: projectName,
+		ProjectName: requestProjectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "images", fingerprint).Project(effectiveProjectName),
 		Type:        operationtype.ImageDelete,
 		Class:       operations.OperationClassTask,
-		Resources:   resources,
 		RunHook:     do,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := opCreator(s, args)
 	if err != nil {
 		return nil, err
 	}
@@ -3222,28 +3236,21 @@ func doImageGet(ctx context.Context, tx *db.ClusterTx, project, fingerprint stri
 	return imgInfo, nil
 }
 
-// imageValidSecret searches for an ImageToken operation running on any member in the default project that has an
-// images resource matching the specified fingerprint and the metadata secret field matches the specified secret.
+// imageValidSecret searches for an image upload or download token operation running on any member in the given
+// project that has a matching fingerprint and secret in its metadata.
 // If an operation is found it is returned and the operation is cancelled. Otherwise nil is returned if not found.
-func imageValidSecret(s *state.State, r *http.Request, projectName string, fingerprint string, secret string) (*api.Operation, error) {
-	ops, err := operationsGetByType(r.Context(), s, projectName, operationtype.ImageToken)
+func imageValidSecret(s *state.State, r *http.Request, projectName string, fingerprint string, secret string, tokenType operationtype.Type) (*api.Operation, error) {
+	ops, err := operationsGetByType(r.Context(), s, projectName, tokenType)
 	if err != nil {
 		return nil, fmt.Errorf("Failed getting image token operations: %w", err)
 	}
 
-	fingerprintURLPath := api.NewURL().Path(version.APIVersion, "images", fingerprint).String()
-
 	for _, op := range ops {
-		if op.Resources == nil {
+		if op.Metadata == nil {
 			continue
 		}
 
-		opImages, ok := op.Resources["images"]
-		if !ok {
-			continue
-		}
-
-		if !shared.StringPrefixInSlice(fingerprintURLPath, opImages) {
+		if op.Metadata["fingerprint"] != fingerprint {
 			continue
 		}
 
@@ -3418,7 +3425,7 @@ func imageGet(d *Daemon, r *http.Request) response.Response {
 	if secret != "" {
 		// If a secret was provided, validate it regardless of whether the image is public or the caller has sufficient
 		// privilege. This is to ensure the image token operation is cancelled.
-		op, err := imageValidSecret(s, r, projectName, info.Fingerprint, secret)
+		op, err := imageValidSecret(s, r, projectName, info.Fingerprint, secret, operationtype.ImageDownloadToken)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -3874,7 +3881,7 @@ func imageAliasesPost(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 
 	s := d.State()
 
@@ -3909,7 +3916,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 			return err
 		}
 
-		if recursion {
+		if recursion > 0 {
 			responseMap = make([]*api.ImageAliasesEntry, 0, len(names))
 		} else {
 			responseStr = make([]string, 0, len(names))
@@ -3920,7 +3927,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 				continue
 			}
 
-			if !recursion {
+			if recursion == 0 {
 				responseStr = append(responseStr, api.NewURL().Path(version.APIVersion, "images", "aliases", name).String())
 			} else {
 				_, alias, err := tx.GetImageAlias(ctx, projectName, name, true)
@@ -3939,7 +3946,7 @@ func imageAliasesGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, responseStr)
 	}
 
@@ -4532,7 +4539,7 @@ func imageExport(d *Daemon, r *http.Request) response.Response {
 	if secret != "" {
 		// If a secret was provided, validate it regardless of whether the image is public or the caller has sufficient
 		// privilege. This is to ensure the image token operation is cancelled.
-		op, err := imageValidSecret(s, r, projectName, imgInfo.Fingerprint, secret)
+		op, err := imageValidSecret(s, r, projectName, imgInfo.Fingerprint, secret, operationtype.ImageDownloadToken)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -4672,10 +4679,6 @@ func imageExportFiles(ctx context.Context, s *state.State, imgInfo *api.Image, r
 //	    $ref: "#/responses/InternalServerError"
 func imageExportPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	projectName := request.ProjectParam(r)
 	details, err := request.GetContextValue[imageDetails](r.Context(), ctxImageDetails)
@@ -4783,12 +4786,13 @@ func imageExportPost(d *Daemon, r *http.Request) response.Response {
 
 	opArgs := operations.OperationArgs{
 		ProjectName: projectName,
-		Type:        operationtype.ImageDownload,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "images", details.image.Fingerprint).Project(details.image.Project),
+		Type:        operationtype.ImageUpload,
 		Class:       operations.OperationClassTask,
 		RunHook:     run,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, opArgs)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, opArgs)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -4829,7 +4833,7 @@ func imageSecret(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	return createTokenResponse(s, r, projectName, details.image.Fingerprint, nil)
+	return createImageTokenResponse(s, r, projectName, details.image.Fingerprint, nil, operationtype.ImageDownloadToken)
 }
 
 func imageImportFromNode(imagesDir string, client lxd.InstanceServer, fingerprint string) error {
@@ -4930,10 +4934,6 @@ func imageImportFromNode(imagesDir string, client lxd.InstanceServer, fingerprin
 //	    $ref: "#/responses/InternalServerError"
 func imageRefresh(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	projectName := request.ProjectParam(r)
 	details, err := request.GetContextValue[imageDetails](r.Context(), ctxImageDetails)
@@ -4993,12 +4993,13 @@ func imageRefresh(d *Daemon, r *http.Request) response.Response {
 
 	args := operations.OperationArgs{
 		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "images", details.image.Fingerprint).Project(details.image.Project),
 		Type:        operationtype.ImageRefresh,
 		Class:       operations.OperationClassTask,
 		RunHook:     run,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -5037,7 +5038,7 @@ func autoSyncImagesTask(stateFunc func() *state.State) (task.Func, task.Schedule
 			RunHook: opRun,
 		}
 
-		op, err := operations.CreateServerOperation(s, args)
+		op, err := operations.ScheduleServerOperation(s, args)
 		if err != nil {
 			logger.Error("Failed creating image synchronization operation", logger.Ctx{"err": err})
 			return
@@ -5228,12 +5229,7 @@ func imageSyncBetweenNodes(ctx context.Context, s *state.State, r *http.Request,
 	return nil
 }
 
-func createTokenResponse(s *state.State, r *http.Request, projectName string, fingerprint string, metadata shared.Jmap) response.Response {
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
-
+func createImageTokenResponse(s *state.State, r *http.Request, projectName string, fingerprint string, metadata shared.Jmap, tokenType operationtype.Type) response.Response {
 	secret, err := shared.RandomCryptoString()
 	if err != nil {
 		return response.InternalError(err)
@@ -5244,19 +5240,38 @@ func createTokenResponse(s *state.State, r *http.Request, projectName string, fi
 	maps.Copy(meta, metadata)
 
 	meta["secret"] = secret
+	meta["fingerprint"] = fingerprint
 
-	resources := map[string][]api.URL{}
-	resources["images"] = []api.URL{*api.NewURL().Path(version.APIVersion, "images", fingerprint)}
+	// If downloading an image, the image is the primary entity.
+	// If uploading an image, the project is the primary entity.
+	resources := make(map[entity.Type][]api.URL)
+	var entityURL *api.URL
+	switch tokenType {
+	case operationtype.ImageUploadToken:
+		entityURL = api.NewURL().Path(version.APIVersion, "projects", projectName)
+		resources[entity.TypeProject] = []api.URL{*entityURL}
+	case operationtype.ImageDownloadToken:
+		effectiveProjectName, err := request.GetContextValue[string](r.Context(), request.CtxEffectiveProjectName)
+		if err != nil {
+			return response.SmartError(err)
+		}
+
+		entityURL = api.NewURL().Path(version.APIVersion, "images", fingerprint).Project(effectiveProjectName)
+		resources[entity.TypeImage] = []api.URL{*entityURL}
+	default:
+		return response.SmartError(errors.New("Not an image token operation type"))
+	}
 
 	args := operations.OperationArgs{
 		ProjectName: projectName,
-		Type:        operationtype.ImageToken,
+		EntityURL:   entityURL,
+		Type:        tokenType,
 		Class:       operations.OperationClassToken,
 		Resources:   resources,
 		Metadata:    meta,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}

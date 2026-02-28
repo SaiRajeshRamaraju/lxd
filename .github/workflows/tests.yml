@@ -187,11 +187,15 @@ jobs:
           cd /home/runner/work/lxd/lxd-test
           make
 
-      # XXX: `make static-analysis` also run golangci-lint but this one provides
-      #      useful feedback in the PR through github-code-scanning bot
+      - name: Get pinned golangci-lint version
+        id: golangci-lint-version
+        run: echo "version=$(go list -C tools -m -f '{{.Version}}' github.com/golangci/golangci-lint/v2)" >> "$GITHUB_OUTPUT"
+
       - name: Run golangci-lint
         if: github.event_name == 'pull_request' || github.event_name == 'schedule'
-        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v8
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: ${{ steps.golangci-lint-version.outputs.version }}
 
       - name: Run static analysis
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.static-analysis == 'true' }}
@@ -263,6 +267,7 @@ jobs:
             /home/runner/go/bin/lxd-client
             /home/runner/go/bin/lxd-convert
             /home/runner/go/bin/lxd-user
+            /home/runner/go/bin/mini-loki
             /home/runner/go/bin/mini-oidc
             /home/runner/go/bin/sysinfo
           retention-days: 1
@@ -284,10 +289,9 @@ jobs:
       LXD_CEPH_CEPHOBJECT_RADOSGW: "http://127.0.0.1"
       LXD_OVN_NB_CONNECTION: "ssl:127.0.0.1:6641"
       LXD_VERBOSE: "1"
-      LXD_OFFLINE: "1"
       LXD_TMPFS: "1"
       GOTRACEBACK: "crash"
-      SUDO_PRESERVE_ENV: "PATH,GOPATH,GOCOVERDIR,GOTRACEBACK,GITHUB_ACTIONS,GITHUB_STEP_SUMMARY,SNAP_CACHE_DIR,IMAGE_CACHE_DIR,LXD_VERBOSE,LXD_REPEAT_TESTS,LXD_BACKENDS,LXD_BACKEND,LXD_CEPH_CLUSTER,LXD_CEPH_CEPHFS,LXD_CEPH_CEPHOBJECT_RADOSGW,LXD_OVN_NB_CONNECTION,LXD_OVN_NB_CLIENT_CRT_FILE,LXD_OVN_NB_CLIENT_KEY_FILE,LXD_OVN_NB_CA_CRT_FILE,LXD_OFFLINE,LXD_SKIP_TESTS,LXD_REQUIRED_TESTS,LXD_TMPFS"
+      SUDO_PRESERVE_ENV: "PATH,GOPATH,GOCOVERDIR,GOTRACEBACK,GITHUB_ACTIONS,GITHUB_STEP_SUMMARY,SNAP_CACHE_DIR,IMAGE_CACHE_DIR,LXD_VERBOSE,LXD_REPEAT_TESTS,LXD_BACKENDS,LXD_BACKEND,LXD_CEPH_CLUSTER,LXD_CEPH_CEPHFS,LXD_CEPH_CEPHOBJECT_RADOSGW,LXD_OVN_NB_CONNECTION,LXD_OVN_NB_CLIENT_CRT_FILE,LXD_OVN_NB_CLIENT_KEY_FILE,LXD_OVN_NB_CA_CRT_FILE,LXD_SKIP_TESTS,LXD_REQUIRED_TESTS,LXD_TMPFS"
     if: ${{ github.event_name != 'schedule' || github.repository == 'canonical/lxd' }}
     name: System
     runs-on: ubuntu-24.04
@@ -503,7 +507,7 @@ jobs:
         with:
           name: crash-dumps-${{ steps.sanitize.outputs.artifact_name }}
           path: |
-            /var/crash/core-*
+            /var/crash/*
           retention-days: 5
           if-no-files-found: ignore
 
@@ -545,9 +549,7 @@ jobs:
         test:
           - cgroup
           - cloud-init
-          # Known broken on 24.04 with HWE kernel (used by GHA runners starting on 2026-02-12)
-          # (https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2141715)
-          #- cluster
+          - cluster
           - container
           - container-copy
           - container-nesting
@@ -810,7 +812,7 @@ jobs:
         with:
           name: crash-dumps-${{ steps.sanitize.outputs.artifact_name }}
           path: |
-            /var/crash/core-*
+            /var/crash/*
           retention-days: 5
           if-no-files-found: ignore
 

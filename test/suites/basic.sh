@@ -49,8 +49,6 @@ test_basic_usage() {
 
   # test GET /1.0, since the client always puts to /1.0/
   my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0"
-  my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0/containers"
-  my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0/virtual-machines"
   my_curl --fail --output /dev/null "https://${LXD_ADDR}/1.0/instances"
 
   # Re-import the image
@@ -134,6 +132,9 @@ test_basic_usage() {
   [ "$(lxc list -f csv -c S c1)" = "2" ]
   lxc delete --force c1
 
+  # Test log directory cleanup after deletion
+  [ ! -d "${LXD_DIR}/logs/c1" ]
+
   # Test list json format
   lxc list --format json | jq --exit-status '.[] | .name == "foo"'
 
@@ -197,7 +198,7 @@ test_basic_usage() {
   gen_cert_and_key client3
 
   # don't allow requests without a cert to get trusted data
-  [ "$(curl -k -s -o /dev/null -w "%{http_code}" "https://${LXD_ADDR}/1.0/containers/foo")" = "403" ]
+  [ "$(curl -k -s -o /dev/null -w "%{http_code}" "https://${LXD_ADDR}/1.0/instances/foo")" = "403" ]
 
   # Test unprivileged container publish
   lxc publish bar --alias=foo-image prop1=val1
@@ -246,6 +247,8 @@ test_basic_usage() {
     false
   fi
 
+  # Ensure invalid compression algorithm is rejected.
+  [ "$(CLIENT_DEBUG="" SHELL_TRACING="" lxc publish bar --compression=ls 2>&1)" = 'Error: Invalid compression algorithm "ls"' ]
 
   # Test image compression on publish
   lxc publish bar --alias=foo-image-compressed --compression=bzip2 prop=val1
@@ -368,15 +371,15 @@ test_basic_usage() {
   lxc delete "${RDNAME}"
 
   # Test "nonetype" container creation
-  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers" \
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances" \
         -d '{"name":"nonetype","source":{"type":"none"}}'
   lxc delete nonetype
 
   # Test "nonetype" container creation with an LXC config
-  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers" \
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances" \
         -d '{"name":"configtest","config":{"raw.lxc":"lxc.hook.clone=/bin/true"},"source":{"type":"none"}}'
   # shellcheck disable=SC2102
-  my_curl "https://${LXD_ADDR}/1.0/containers/configtest" | jq --exit-status '.metadata.config["raw.lxc"] == "lxc.hook.clone=/bin/true"'
+  my_curl "https://${LXD_ADDR}/1.0/instances/configtest" | jq --exit-status '.metadata.config["raw.lxc"] == "lxc.hook.clone=/bin/true"'
   lxc delete configtest
 
   # Test activateifneeded/shutdown
@@ -547,7 +550,7 @@ test_basic_usage() {
   lxc profile delete clash
 
   # check that we can get the return code for a non- wait-for-websocket exec
-  op="$(my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq --exit-status --raw-output .operation)"
+  op="$(my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances/foo/exec" -d '{"command": ["echo", "test"], "environment": {}, "wait-for-websocket": false, "interactive": false}' | jq --exit-status --raw-output .operation)"
   my_curl "https://${LXD_ADDR}${op}/wait" | jq --exit-status '.metadata.metadata.return != "null"'
 
   # test file transfer
@@ -594,7 +597,7 @@ test_basic_usage() {
   lxc delete foo -f
 
   lxc launch testimage deleterunning
-  my_curl -X DELETE "https://${LXD_ADDR}/1.0/containers/deleterunning" | grep "Instance is running"
+  my_curl -X DELETE "https://${LXD_ADDR}/1.0/instances/deleterunning" | grep "Instance is running"
   lxc delete deleterunning -f
 
   if [ -e /sys/module/apparmor/ ]; then
@@ -751,22 +754,27 @@ test_basic_usage() {
   ! lxc exec c1 -- stat /data.txt || false
   lxc delete c1 -f
 
-  # Test a forced rebuild
+  # Test a forced rebuild and make sure the volatile.uuid is preserved across the rebuild.
   lxc launch testimage c1
+  ORIGINAL_UUID="$(lxc config get c1 volatile.uuid)"
   ! lxc rebuild testimage c1 || false
   lxc rebuild testimage c1 --force
+  [ "$(lxc config get c1 volatile.uuid)" = "${ORIGINAL_UUID}" ]
   lxc delete c1 -f
 
   # Test rebuilding an instance with a new image.
   lxc init c1 --empty
+  [ "$(lxc config get c1 image.os || echo fail)" = "" ]
   lxc rebuild testimage c1
+  [ "$(lxc config get c1 image.os)" = "BusyBox" ]
   lxc start c1
   lxc delete c1 -f
 
   # Test rebuilding an instance with an empty file system.
   lxc init testimage c1
+  [ "$(lxc config get c1 image.os)" = "BusyBox" ]
   lxc rebuild c1 --empty
-  ! lxc config show c1 | grep -F 'image.' || false
+  [ "$(lxc config get c1 image.os || echo fail)" = "" ]
   lxc delete c1
 
   # Test assigning an empty profile (with no root disk device) to an instance.

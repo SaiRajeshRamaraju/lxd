@@ -765,7 +765,7 @@ func (g *cmdGlobal) cmpInstancesAction(toComplete string, action string, flagFor
 	if len(resources) > 0 {
 		resource := resources[0]
 
-		instances, _ := resource.server.GetInstances("")
+		instances, _ := resource.server.GetInstances(lxd.GetInstancesArgs{InstanceType: api.InstanceTypeAny})
 
 		results = make([]string, 0, len(instances))
 		for _, instance := range instances {
@@ -934,7 +934,10 @@ func (g *cmdGlobal) cmpNetworkForwardPortTargetAddresses(networkName string, lis
 	}
 
 	resource := resources[0]
-	instances, err := resource.server.GetInstancesFull(api.InstanceTypeAny)
+	instances, err := resource.server.GetInstancesFull(lxd.GetInstancesFullArgs{
+		InstanceType: api.InstanceTypeAny,
+		Fields:       []string{"state.network"},
+	})
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}

@@ -58,6 +58,9 @@ test_vm_empty() {
   lxc stop -f v1
   [ "$(lxc list -f csv -c s v1)" = "STOPPED" ]
   lxc delete v1
+
+  echo "==> Test VM log directory cleanup after deletion"
+  [ ! -d "${LXD_DIR}/logs/v1" ]
 }
 
 test_vm_pcie_bus() {
@@ -139,7 +142,12 @@ test_vm_pcie_bus() {
 
   # The default value for "limits.max_bus_ports" is 8 ports.
   # Fill all the available slots with PCIe devices.
-  for i in $(seq 1 5); do
+  local lower_bound=1
+  if coverage_enabled; then
+    # When coverage is enabled, the GOCOVERDIR is shared between the host and the VM taking one more port.
+    lower_bound=2
+  fi
+  for i in $(seq "${lower_bound}" 5); do
     lxc config device add v1 "aaa${i}" nic nictype=p2p
   done
 

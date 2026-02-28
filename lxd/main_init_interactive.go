@@ -996,6 +996,22 @@ they otherwise would.
 
 			config.Node.Config["core.https_address"] = util.CanonicalNetworkAddressFromAddressAndPort(netAddr, netPort, shared.HTTPSDefaultPort)
 		}
+
+		// Ask if the user wants to create an initial UI access link.
+		// Skip if already enabled using a flag.
+		hasServerAddress := (config.Node.Config["core.https_address"] != nil || len(server.Environment.Addresses) > 0)
+		if hasServerAddress && !c.flagUIInitialAccessLink {
+			enableUIInitialAccessLink, err := c.global.asker.AskBool("Would you like to create an initial LXD UI access link? (yes/no) [default=yes]: ", "yes")
+			if err != nil {
+				return err
+			}
+
+			if enableUIInitialAccessLink {
+				// Enable initial access link flag, and we will
+				// generate the link at the end.
+				c.flagUIInitialAccessLink = true
+			}
+		}
 	}
 
 	// Ask if the user wants images to be automatically refreshed

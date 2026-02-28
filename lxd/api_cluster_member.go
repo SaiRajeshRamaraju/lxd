@@ -163,7 +163,7 @@ var clusterMemberStateCmd = APIEndpoint{
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func clusterMembersGet(d *Daemon, r *http.Request) response.Response {
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 	s := d.State()
 
 	leaderInfo, err := s.LeaderInfo()
@@ -201,7 +201,7 @@ func clusterMembersGet(d *Daemon, r *http.Request) response.Response {
 			return fmt.Errorf("Failed getting cluster members: %w", err)
 		}
 
-		if recursion {
+		if recursion > 0 {
 			memberFailureDomains, err := tx.GetNodesFailureDomains(ctx)
 			if err != nil {
 				return fmt.Errorf("Failed loading member failure domains: %w", err)
@@ -233,7 +233,7 @@ func clusterMembersGet(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if recursion {
+	if recursion > 0 {
 		return response.SyncResponse(true, membersInfo)
 	}
 
@@ -277,15 +277,11 @@ var clusterMembersPostMu sync.Mutex // Used to prevent races when creating clust
 //	    $ref: "#/responses/InternalServerError"
 func clusterMembersPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	req := api.ClusterMembersPost{}
 
 	// Parse the request.
-	err = json.NewDecoder(r.Body).Decode(&req)
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -392,17 +388,13 @@ func clusterMembersPost(d *Daemon, r *http.Request) response.Response {
 		"expiresAt":   expiry,
 	}
 
-	resources := map[string][]api.URL{}
-	resources["cluster"] = []api.URL{}
-
 	args := operations.OperationArgs{
-		Type:      operationtype.ClusterJoinToken,
-		Class:     operations.OperationClassToken,
-		Resources: resources,
-		Metadata:  meta,
+		Type:     operationtype.ClusterJoinToken,
+		Class:    operations.OperationClassToken,
+		Metadata: meta,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -1341,10 +1333,6 @@ func clusterMemberStatePost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	// Forward request
 	resp := forwardedResponseToNode(r.Context(), s, name)
@@ -1463,7 +1451,7 @@ func clusterMemberStatePost(d *Daemon, r *http.Request) response.Response {
 			RunHook:     run,
 		}
 
-		op, err := operations.CreateUserOperation(s, requestor, args)
+		op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 		if err != nil {
 			return response.SmartError(err)
 		}
@@ -1756,10 +1744,6 @@ func evacuateClusterSelectTarget(ctx context.Context, s *state.State, inst insta
 
 func restoreClusterMember(d *Daemon, r *http.Request, mode string) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	originName, err := url.PathUnescape(mux.Vars(r)["name"])
 	if err != nil {
@@ -2002,7 +1986,7 @@ func restoreClusterMember(d *Daemon, r *http.Request, mode string) response.Resp
 		RunHook:     run,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}

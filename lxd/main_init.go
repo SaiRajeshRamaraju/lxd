@@ -5,7 +5,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -26,12 +28,13 @@ type cmdInit struct {
 	flagPreseed bool
 	flagDump    bool
 
-	flagNetworkAddress  string
-	flagNetworkPort     int64
-	flagStorageBackend  string
-	flagStorageDevice   string
-	flagStorageLoopSize int
-	flagStoragePool     string
+	flagNetworkAddress      string
+	flagNetworkPort         int64
+	flagStorageBackend      string
+	flagStorageDevice       string
+	flagStorageLoopSize     int
+	flagStoragePool         string
+	flagUIInitialAccessLink bool
 
 	hostname string
 }
@@ -45,11 +48,16 @@ func (c *cmdInit) Command() *cobra.Command {
   Configure the LXD daemon
 `
 	cmd.Example = `  init --minimal
-  init --auto [--network-address=IP] [--network-port=8443] [--storage-backend=dir]
-              [--storage-create-device=DEVICE] [--storage-create-loop=SIZE]
+  init --auto [--network-address=IP]
+              [--network-port=8443]
+              [--storage-backend=dir]
+              [--storage-create-device=DEVICE]
+              [--storage-create-loop=SIZE]
               [--storage-pool=POOL]
+              [--ui-initial-access-link]
   init --preseed
   init --dump
+  init --ui-initial-access-link
 `
 	cmd.RunE = c.Run
 	cmd.Flags().BoolVar(&c.flagAuto, "auto", false, "Automatic (non-interactive) mode")
@@ -63,6 +71,7 @@ func (c *cmdInit) Command() *cobra.Command {
 	cmd.Flags().StringVar(&c.flagStorageDevice, "storage-create-device", "", cli.FormatStringFlagLabel("Setup device based storage using DEVICE"))
 	cmd.Flags().IntVar(&c.flagStorageLoopSize, "storage-create-loop", -1, "Setup loop based storage with SIZE in GiB")
 	cmd.Flags().StringVar(&c.flagStoragePool, "storage-pool", "", cli.FormatStringFlagLabel("Storage pool to use or create"))
+	cmd.Flags().BoolVar(&c.flagUIInitialAccessLink, "ui-initial-access-link", false, "Generate the URL for accessing LXD UI before remote API authentication is configured")
 
 	return cmd
 }
@@ -71,15 +80,19 @@ func (c *cmdInit) Command() *cobra.Command {
 func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	// Quick checks.
 	if c.flagAuto && c.flagPreseed {
-		return errors.New("Can't use --auto and --preseed together")
+		return errors.New("Cannot use --auto and --preseed together")
 	}
 
 	if c.flagMinimal && c.flagPreseed {
-		return errors.New("Can't use --minimal and --preseed together")
+		return errors.New("Cannot use --minimal and --preseed together")
 	}
 
 	if c.flagMinimal && c.flagAuto {
-		return errors.New("Can't use --minimal and --auto together")
+		return errors.New("Cannot use --minimal and --auto together")
+	}
+
+	if c.flagUIInitialAccessLink && (c.flagPreseed || c.flagDump || c.flagMinimal) {
+		return errors.New("Cannot use --ui-initial-access-link with --preseed, --dump, or --minimal")
 	}
 
 	if !c.flagAuto && (c.flagNetworkAddress != "" || c.flagNetworkPort != -1 ||
@@ -93,7 +106,7 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		c.flagNetworkPort != -1 || c.flagStorageBackend != "" ||
 		c.flagStorageDevice != "" || c.flagStorageLoopSize != -1 ||
 		c.flagStoragePool != "") {
-		return errors.New("Can't use --dump with other flags")
+		return errors.New("Cannot use --dump with other flags")
 	}
 
 	// Connect to LXD
@@ -105,6 +118,12 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 	server, _, err := d.GetServer()
 	if err != nil {
 		return fmt.Errorf("Failed to connect to get LXD server info: %w", err)
+	}
+
+	// If UI initial access link flag is set, but auto mode is not enabled,
+	// generate the link and exit.
+	if c.flagUIInitialAccessLink && !c.flagAuto {
+		return c.createUIInitialAccessLink(d)
 	}
 
 	// Dump mode
@@ -240,6 +259,13 @@ func (c *cmdInit) Run(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	if c.flagUIInitialAccessLink {
+		err = c.createUIInitialAccessLink(d)
+		if err != nil {
+			return err
+		}
+	}
+
 	revert.Success()
 	return nil
 }
@@ -257,4 +283,56 @@ func (c *cmdInit) defaultHostname() string {
 
 	c.hostname = hostName
 	return hostName
+}
+
+func (c *cmdInit) createUIInitialAccessLink(d lxd.InstanceServer) error {
+	// Refresh server info.
+	server, _, err := d.GetServer()
+	if err != nil {
+		return fmt.Errorf("Failed to refresh LXD server info: %w", err)
+	}
+
+	var serverAddress string
+	if len(server.Environment.Addresses) > 0 {
+		serverAddress = server.Environment.Addresses[0]
+	}
+
+	if serverAddress == "" {
+		return errors.New("LXD server address is not set, cannot create UI initial access link")
+	}
+
+	uiAdminIdentityName := "ui-admin-initial"
+
+	// Check if identity already exists.
+	uiAdminIdentity, _, err := d.GetIdentity(api.AuthenticationMethodBearer, uiAdminIdentityName)
+	if err != nil && !api.StatusErrorCheck(err, http.StatusNotFound) {
+		return fmt.Errorf("Failed to check for existing initial UI identity: %w", err)
+	}
+
+	if uiAdminIdentity == nil {
+		// Create identity if it doesn't exist.
+		uiAdminIdentityReq := api.IdentitiesBearerPost{
+			Name: uiAdminIdentityName,
+			Type: api.IdentityTypeBearerTokenInitialUI,
+		}
+
+		err := d.CreateIdentityBearer(uiAdminIdentityReq)
+		if err != nil {
+			return fmt.Errorf("Failed to create initial UI identity: %w", err)
+		}
+	} else if uiAdminIdentity.Type != api.IdentityTypeBearerTokenInitialUI {
+		return fmt.Errorf("A bearer identity with name %q already exists but is not of type %q", uiAdminIdentityName, api.IdentityTypeBearerTokenInitialUI)
+	}
+
+	token, err := d.IssueBearerIdentityToken(uiAdminIdentityName, api.IdentityBearerTokenPost{})
+	if err != nil {
+		return fmt.Errorf("Failed to issue bearer token for initial UI access link: %w", err)
+	}
+
+	tokenExpiry := time.Now().Add(24 * time.Hour).Format("2006-01-02 15:04")
+	uiAccessLink := api.NewURL().Scheme("https").Host(serverAddress).WithQuery("token", token.Token)
+	fmt.Println("UI initial identity (type: " + api.IdentityTypeBearerTokenInitialUI + "): " + uiAdminIdentityName)
+	fmt.Println("UI initial access link (expires: " + tokenExpiry + "): " + uiAccessLink.String())
+
+	return nil
 }

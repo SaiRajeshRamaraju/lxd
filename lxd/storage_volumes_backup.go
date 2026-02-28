@@ -30,6 +30,7 @@ import (
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
 	"github.com/canonical/lxd/shared/logger"
+	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -194,7 +195,7 @@ func storagePoolVolumeTypeCustomBackupsGet(d *Daemon, r *http.Request) response.
 		return resp
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 
 	var volumeBackups []db.StoragePoolVolumeBackup
 
@@ -231,7 +232,7 @@ func storagePoolVolumeTypeCustomBackupsGet(d *Daemon, r *http.Request) response.
 			continue
 		}
 
-		if !recursion {
+		if recursion == 0 {
 			url := api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", "custom", details.volumeName, "backups", backupName).String()
 			resultString = append(resultString, url)
 		} else {
@@ -240,7 +241,7 @@ func storagePoolVolumeTypeCustomBackupsGet(d *Daemon, r *http.Request) response.
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
 	}
 
@@ -286,10 +287,6 @@ func storagePoolVolumeTypeCustomBackupsGet(d *Daemon, r *http.Request) response.
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumeTypeCustomBackupsPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	details, err := request.GetContextValue[storageVolumeDetails](r.Context(), ctxStorageVolumeDetails)
 	if err != nil {
@@ -359,6 +356,13 @@ func storagePoolVolumeTypeCustomBackupsPost(d *Daemon, r *http.Request) response
 	err = json.Unmarshal(body, &req)
 	if err != nil {
 		return response.BadRequest(err)
+	}
+
+	if req.CompressionAlgorithm != "" {
+		err = validate.IsCompressionAlgorithm(req.CompressionAlgorithm)
+		if err != nil {
+			return response.BadRequest(err)
+		}
 	}
 
 	if req.Name == "" {
@@ -438,22 +442,22 @@ func storagePoolVolumeTypeCustomBackupsPost(d *Daemon, r *http.Request) response
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["storage_volumes"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName)}
-	resources["backups"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName)}
-
+	volumeURL := api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName).Project(requestProjectName)
 	args := operations.OperationArgs{
 		ProjectName: requestProjectName,
+		EntityURL:   volumeURL,
 		Type:        operationtype.CustomVolumeBackupCreate,
 		Class:       operations.OperationClassTask,
-		Resources:   resources,
 		RunHook:     backup,
+		Resources: map[entity.Type][]api.URL{
+			entity.TypeStorageVolume: {*volumeURL},
+		},
 		Metadata: map[string]any{
-			"entity_url": api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName).Project(requestProjectName).String(),
+			operations.EntityURL: api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName).Project(requestProjectName).String(),
 		},
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -590,10 +594,6 @@ func storagePoolVolumeTypeCustomBackupGet(d *Daemon, r *http.Request) response.R
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumeTypeCustomBackupPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	details, err := request.GetContextValue[storageVolumeDetails](r.Context(), ctxStorageVolumeDetails)
 	if err != nil {
@@ -660,19 +660,19 @@ func storagePoolVolumeTypeCustomBackupPost(d *Daemon, r *http.Request) response.
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["storage_volumes"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName)}
-	resources["backups"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", oldName)}
-
+	backupURL := api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName)
 	args := operations.OperationArgs{
 		ProjectName: requestProjectName,
+		EntityURL:   backupURL,
 		Type:        operationtype.CustomVolumeBackupRename,
 		Class:       operations.OperationClassTask,
-		Resources:   resources,
 		RunHook:     rename,
+		Resources: map[entity.Type][]api.URL{
+			entity.TypeStorageVolumeBackup: {*backupURL},
+		},
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -713,10 +713,6 @@ func storagePoolVolumeTypeCustomBackupPost(d *Daemon, r *http.Request) response.
 //	    $ref: "#/responses/InternalServerError"
 func storagePoolVolumeTypeCustomBackupDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	details, err := request.GetContextValue[storageVolumeDetails](r.Context(), ctxStorageVolumeDetails)
 	if err != nil {
@@ -769,19 +765,19 @@ func storagePoolVolumeTypeCustomBackupDelete(d *Daemon, r *http.Request) respons
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["storage_volumes"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName)}
-	resources["backups"] = []api.URL{*api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName)}
-
+	backupURL := api.NewURL().Path(version.APIVersion, "storage-pools", details.pool.Name(), "volumes", details.volumeTypeName, details.volumeName, "backups", backupName).Project(effectiveProjectName)
 	args := operations.OperationArgs{
 		ProjectName: requestProjectName,
+		EntityURL:   backupURL,
 		Type:        operationtype.CustomVolumeBackupRemove,
 		Class:       operations.OperationClassTask,
-		Resources:   resources,
 		RunHook:     remove,
+		Resources: map[entity.Type][]api.URL{
+			entity.TypeStorageVolumeBackup: {*backupURL},
+		},
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}

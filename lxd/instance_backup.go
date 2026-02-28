@@ -19,7 +19,6 @@ import (
 	"github.com/canonical/lxd/lxd/db"
 	"github.com/canonical/lxd/lxd/db/operationtype"
 	"github.com/canonical/lxd/lxd/instance"
-	"github.com/canonical/lxd/lxd/instance/instancetype"
 	"github.com/canonical/lxd/lxd/lifecycle"
 	"github.com/canonical/lxd/lxd/operations"
 	"github.com/canonical/lxd/lxd/project"
@@ -30,6 +29,7 @@ import (
 	"github.com/canonical/lxd/shared"
 	"github.com/canonical/lxd/shared/api"
 	"github.com/canonical/lxd/shared/entity"
+	"github.com/canonical/lxd/shared/validate"
 	"github.com/canonical/lxd/shared/version"
 )
 
@@ -153,7 +153,7 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 		return resp
 	}
 
-	recursion := util.IsRecursionRequest(r)
+	recursion, _ := util.IsRecursionRequest(r)
 
 	c, err := instance.LoadByProjectAndName(s, projectName, cname)
 	if err != nil {
@@ -183,7 +183,7 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 			continue
 		}
 
-		if !recursion {
+		if recursion == 0 {
 			resultString = append(resultString, api.NewURL().Path(version.APIVersion, "instances", cname, "backups", backupName).String())
 		} else {
 			render := backup.Render()
@@ -191,7 +191,7 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 		}
 	}
 
-	if !recursion {
+	if recursion == 0 {
 		return response.SyncResponse(true, resultString)
 	}
 
@@ -232,10 +232,6 @@ func instanceBackupsGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/InternalServerError"
 func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
@@ -298,6 +294,13 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 	err = json.Unmarshal(body, &req)
 	if err != nil {
 		return response.BadRequest(err)
+	}
+
+	if req.CompressionAlgorithm != "" {
+		err = validate.IsCompressionAlgorithm(req.CompressionAlgorithm)
+		if err != nil {
+			return response.BadRequest(err)
+		}
 	}
 
 	if req.Name == "" {
@@ -371,21 +374,17 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-
-	if inst.Type() == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	resources := map[entity.Type][]api.URL{
+		entity.TypeInstance: {*api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName)},
 	}
 
-	resources["backups"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName)}
-
 	metadata := map[string]any{
-		"entity_url": api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(inst.Project().Name).String(),
+		operations.EntityURL: api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(inst.Project().Name).String(),
 	}
 
 	args := operations.OperationArgs{
 		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName),
 		Type:        operationtype.BackupCreate,
 		Class:       operations.OperationClassTask,
 		Resources:   resources,
@@ -393,7 +392,7 @@ func instanceBackupsPost(d *Daemon, r *http.Request) response.Response {
 		Metadata:    metadata,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -517,10 +516,6 @@ func instanceBackupGet(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/InternalServerError"
 func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
@@ -584,21 +579,21 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	if instanceType == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	resources := map[entity.Type][]api.URL{
+		entity.TypeInstance:       {*api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName)},
+		entity.TypeInstanceBackup: {*api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(projectName)},
 	}
 
 	args := operations.OperationArgs{
 		ProjectName: projectName,
 		Type:        operationtype.BackupRename,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(projectName),
 		Class:       operations.OperationClassTask,
 		Resources:   resources,
 		RunHook:     rename,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}
@@ -634,10 +629,6 @@ func instanceBackupPost(d *Daemon, r *http.Request) response.Response {
 //	    $ref: "#/responses/InternalServerError"
 func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
-	requestor, err := request.GetRequestor(r.Context())
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	instanceType, err := urlInstanceTypeDetect(r)
 	if err != nil {
@@ -684,21 +675,20 @@ func instanceBackupDelete(d *Daemon, r *http.Request) response.Response {
 		return nil
 	}
 
-	resources := map[string][]api.URL{}
-	resources["instances"] = []api.URL{*api.NewURL().Path(version.APIVersion, "instances", name)}
-	if instanceType == instancetype.Container {
-		resources["containers"] = resources["instances"]
+	resources := map[entity.Type][]api.URL{
+		entity.TypeInstance: {*api.NewURL().Path(version.APIVersion, "instances", name).Project(projectName)},
 	}
 
 	args := operations.OperationArgs{
 		ProjectName: projectName,
+		EntityURL:   api.NewURL().Path(version.APIVersion, "instances", name, "backups", backupName).Project(projectName),
 		Type:        operationtype.BackupRemove,
 		Class:       operations.OperationClassTask,
 		Resources:   resources,
 		RunHook:     remove,
 	}
 
-	op, err := operations.CreateUserOperation(s, requestor, args)
+	op, err := operations.ScheduleUserOperationFromRequest(s, r, args)
 	if err != nil {
 		return response.InternalError(err)
 	}

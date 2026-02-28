@@ -481,7 +481,8 @@ func extractEntitlementsFromQuery(r *http.Request, entityType entity.Type, allow
 
 	// Entitlements can only be requested when recursion is enabled for a request returning multiple entities (this function call uses `allowRecursion=true`).
 	// If the request is meant to return a single entity, the entitlements can be requested regardless of the recursion setting (in this case, the function is called with `allowRecursion=false`).
-	if len(validEntitlements) > 0 && (!util.IsRecursionRequest(r) && allowRecursion) {
+	recursion, _ := util.IsRecursionRequest(r)
+	if len(validEntitlements) > 0 && (recursion == 0 && allowRecursion) {
 		return nil, errors.New("Entitlements can only be requested when recursion is enabled")
 	}
 
@@ -569,10 +570,14 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (*request.
 					}
 				}
 
+				// Get expiration date of the matched certificate.
+				certExpiresAt := peerCertificates[matchedFingerprint].NotAfter.UTC()
+
 				return &request.RequestorArgs{
-					Trusted:  trusted,
-					Protocol: protocol,
-					Username: matchedFingerprint,
+					Trusted:   trusted,
+					Protocol:  protocol,
+					Username:  matchedFingerprint,
+					ExpiresAt: &certExpiresAt,
 				}, nil
 			}
 
@@ -622,9 +627,13 @@ func (d *Daemon) Authenticate(w http.ResponseWriter, r *http.Request) (*request.
 	}
 
 	// Check if the caller has a bearer token.
-	isBearerRequest, token, subject := bearer.IsAPIRequest(r, d.globalConfig.ClusterUUID())
+	isBearerRequest, tokenLocation, token, subject := bearer.IsAPIRequest(r, d.globalConfig.ClusterUUID())
 	if isBearerRequest {
-		bearerRequestor, err := bearer.Authenticate(token, subject, d.identityCache)
+		if tokenLocation == auth.TokenLocationQuery {
+			return nil, api.StatusErrorf(http.StatusForbidden, "Token query parameter usage is not allowed for the /1.0 API")
+		}
+
+		bearerRequestor, err := bearer.Authenticate(subject, token, tokenLocation, d.identityCache)
 		if err != nil {
 			// Deny access if the provided token is not verifiable.
 			return nil, fmt.Errorf("Failed to verify bearer token: %w", err)
@@ -1063,7 +1072,9 @@ func (d *Daemon) Init() error {
 func (d *Daemon) setupLoki(URL string, cert string, key string, caCert string, instanceName string, logLevel string, labels []string, types []string) error {
 	// Stop any existing loki client.
 	if d.lokiClient != nil {
+		d.internalListener.RemoveHandler("loki")
 		d.lokiClient.Stop()
+		d.lokiClient = nil
 	}
 
 	// Check basic requirements for starting a new client.

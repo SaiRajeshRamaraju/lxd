@@ -10,27 +10,84 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 
+	"github.com/canonical/lxd/lxd/auth"
 	"github.com/canonical/lxd/lxd/auth/encryption"
 	"github.com/canonical/lxd/lxd/identity"
 	"github.com/canonical/lxd/lxd/request"
 	"github.com/canonical/lxd/shared/api"
 )
 
+// CookieNameSession is the name of the cookie used to store session bearer tokens.
+const CookieNameSession = "token_bearer_session"
+
 // IsDevLXDRequest returns true if the caller sent a bearer token in the Authorization header that is a JWT and appears to
 // have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
 func IsDevLXDRequest(r *http.Request, clusterUUID string) (isRequest bool, token string, subject string) {
-	return isRequestFromAudience(r, clusterUUID, encryption.DevLXDAudience(clusterUUID))
+	return isAuthorizationHeaderRequestFromAudience(r, clusterUUID, encryption.DevLXDAudience(clusterUUID))
 }
 
-// IsAPIRequest returns true if the caller sent a bearer token in the Authorization header that is a JWT and appears to
-// have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
-func IsAPIRequest(r *http.Request, clusterUUID string) (isRequest bool, token string, subject string) {
-	return isRequestFromAudience(r, clusterUUID, encryption.LXDAudience(clusterUUID))
+// IsAPIRequest returns true if the caller sent a JWT that has this LXD cluster as the issuer.
+// If true, it returns the location that the token was found, the raw token, and the subject.
+// The JWT is not verified. The caller must call [Authenticate] to verify the returned raw token.
+func IsAPIRequest(r *http.Request, clusterUUID string) (isRequest bool, location auth.TokenLocation, token string, subject string) {
+	isRequest, token, subject = isAuthorizationHeaderRequestFromAudience(r, clusterUUID, encryption.LXDAudience(clusterUUID))
+	if isRequest {
+		return true, auth.TokenLocationAuthorizationBearer, token, subject
+	}
+
+	isRequest, token, subject = isQueryRequest(r, clusterUUID)
+	if isRequest {
+		return true, auth.TokenLocationQuery, token, subject
+	}
+
+	isRequest, token, subject = isCookieRequest(r, clusterUUID)
+	if isRequest {
+		return true, auth.TokenLocationCookie, token, subject
+	}
+
+	return false, 0, "", ""
 }
 
-// isRequestFromAudience returns true if the caller sent a bearer token in the Authorization header that is a JWT and appears to
-// have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
-func isRequestFromAudience(r *http.Request, clusterUUID string, audience string) (isRequest bool, token string, subject string) {
+// isQueryRequest returns true if the caller sent a bearer token in the "token" query parameter that is a JWT and appears
+// to have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
+func isQueryRequest(r *http.Request, clusterUUID string) (isRequest bool, token string, subject string) {
+	token = r.URL.Query().Get("token")
+	if token == "" {
+		return false, "", ""
+	}
+
+	subject, _, err := isLXDToken(token, clusterUUID, encryption.LXDAudience(clusterUUID))
+	if err != nil {
+		return false, "", ""
+	}
+
+	return true, token, subject
+}
+
+// isCookieRequest returns true if the caller sent a cookie [CookieNameSession] that is a JWT and appears
+// to have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
+func isCookieRequest(r *http.Request, clusterUUID string) (isRequest bool, token string, subject string) {
+	cookie, err := r.Cookie(CookieNameSession)
+	if err != nil {
+		return false, "", ""
+	}
+
+	token = cookie.Value
+	if token == "" {
+		return false, "", ""
+	}
+
+	subject, _, err = isLXDToken(token, clusterUUID, encryption.LXDAudience(clusterUUID))
+	if err != nil {
+		return false, "", ""
+	}
+
+	return true, token, subject
+}
+
+// isAuthorizationHeaderRequestFromAudience returns true if the caller sent a bearer token in the Authorization header that is a
+// JWT and appears to have this LXD cluster as the issuer. If true, it returns the raw token, and the subject.
+func isAuthorizationHeaderRequestFromAudience(r *http.Request, clusterUUID string, audience string) (isRequest bool, token string, subject string) {
 	// Check Authorization header for bearer token.
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || token == "" {
@@ -112,37 +169,82 @@ func isLXDToken(token string, clusterUUID string, expectedAudience string) (stri
 // Authenticate gets a bearer identity from the cache using the given subject, and verifies that it is of the expected
 // type. It then verifies that the token was signed by the secret associated with that identity, and that the token has
 // not expired.
-func Authenticate(token string, subject string, identityCache *identity.Cache) (*request.RequestorArgs, error) {
-	// Get the identity from the cache by the subject.
-	secret, err := identityCache.GetSecret(subject)
-	if err != nil {
-		return nil, api.StatusErrorf(http.StatusForbidden, "Unrecognized token subject: %w", err)
+func Authenticate(subject string, token string, tokenLocation auth.TokenLocation, identityCache *identity.Cache) (*request.RequestorArgs, error) {
+	var secret []byte
+	var getSecretErr error
+	switch tokenLocation {
+	case auth.TokenLocationAuthorizationBearer:
+		// Get the identity from the cache by the subject.
+		secret, getSecretErr = identityCache.GetSecret(subject)
+		if getSecretErr != nil {
+			// If not found, check if the token is for the initial UI identity and report misuse
+			// (the initial UI token should not be set in the authorization header).
+			initialUISecret, err := identityCache.GetInitialUISecret()
+			if err != nil {
+				return nil, api.StatusErrorf(http.StatusForbidden, "Unrecognized token subject: %w", getSecretErr)
+			}
+
+			_, err = verifyToken(token, func() ([]byte, error) {
+				return initialUISecret, nil
+			})
+			if err == nil {
+				return nil, api.NewStatusError(http.StatusForbidden, "The initial UI access token may not be set in the Authorization header")
+			}
+
+			return nil, api.StatusErrorf(http.StatusForbidden, "Unrecognized token subject: %w", getSecretErr)
+		}
+
+	case auth.TokenLocationQuery, auth.TokenLocationCookie:
+		secret, getSecretErr = identityCache.GetInitialUISecret()
+		if getSecretErr != nil {
+			// If not available, check if token is standard bearer token and report misuse (it should not be set in this location).
+			bearerSecret, err := identityCache.GetSecret(subject)
+			if err != nil {
+				return nil, api.StatusErrorf(http.StatusForbidden, "Initial UI authentication not configured: %w", getSecretErr)
+			}
+
+			_, err = verifyToken(token, func() ([]byte, error) {
+				return bearerSecret, nil
+			})
+			if err == nil {
+				return nil, api.NewStatusError(http.StatusForbidden, "Bearer tokens may not be set as a query parameter or as a cookie")
+			}
+
+			return nil, api.StatusErrorf(http.StatusForbidden, "Initial UI authentication not configured: %w", getSecretErr)
+		}
+
+	default:
+		return nil, fmt.Errorf("Invalid token location %d", tokenLocation)
 	}
 
-	err = verifyToken(token, func() ([]byte, error) {
+	expiresAt, getSecretErr := verifyToken(token, func() ([]byte, error) {
 		return secret, nil
 	})
-	if err != nil {
-		return nil, fmt.Errorf("Failed to authenticate bearer token: %w", err)
+	if getSecretErr != nil {
+		return nil, fmt.Errorf("Failed to authenticate bearer token: %w", getSecretErr)
 	}
 
 	return &request.RequestorArgs{
-		Trusted:  true,
-		Protocol: api.AuthenticationMethodBearer,
-		Username: subject,
+		Trusted:   true,
+		Protocol:  api.AuthenticationMethodBearer,
+		Username:  subject,
+		ExpiresAt: expiresAt,
 	}, nil
 }
 
 // VerifySessionToken verifies that a given OIDC session token was signed by a key derived from the given cluster secret
 // using the session ID as a salt.
 func VerifySessionToken(token string, clusterSecret []byte, sessionID uuid.UUID) error {
-	return verifyToken(token, func() ([]byte, error) {
+	_, err := verifyToken(token, func() ([]byte, error) {
 		return encryption.TokenSigningKey(clusterSecret, sessionID[:])
 	})
+
+	return err
 }
 
 // verifyToken verifies that the given token was signed by the key returned by the given key func.
-func verifyToken(token string, keyFunc func() ([]byte, error)) error {
+// For a valid token, an expiration time is returned.
+func verifyToken(token string, keyFunc func() ([]byte, error)) (expiresAt *time.Time, err error) {
 	// Always use UTC time.
 	timeFunc := func() time.Time {
 		return time.Now().UTC()
@@ -163,10 +265,18 @@ func verifyToken(token string, keyFunc func() ([]byte, error)) error {
 	}
 
 	// Verify the token.
-	_, err := parser.Parse(token, jwtKeyFunc)
+	var claims jwt.RegisteredClaims
+	_, err = parser.ParseWithClaims(token, &claims, jwtKeyFunc)
 	if err != nil {
-		return api.StatusErrorf(http.StatusForbidden, "Token is not valid: %w", err)
+		return nil, api.StatusErrorf(http.StatusForbidden, "Token is not valid: %w", err)
 	}
 
-	return nil
+	expiry, err := claims.GetExpirationTime()
+	if err != nil {
+		return nil, api.StatusErrorf(http.StatusForbidden, "Token does not have an expiration time: %w", err)
+	}
+
+	tokenExpiresAt := expiry.UTC()
+
+	return &tokenExpiresAt, nil
 }

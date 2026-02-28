@@ -243,7 +243,10 @@ func api10Get(d *Daemon, r *http.Request) response.Response {
 	s := d.State()
 
 	// Get the authentication methods.
-	authMethods := []string{api.AuthenticationMethodTLS}
+	authMethods := []string{
+		api.AuthenticationMethodTLS,
+		api.AuthenticationMethodBearer,
+	}
 
 	oidcIssuer, oidcClientID, _, _, _, _ := s.GlobalConfig.OIDCServer()
 	if oidcIssuer != "" && oidcClientID != "" {
@@ -1252,6 +1255,10 @@ func doAPI10UpdateTriggers(d *Daemon, nodeChanged, clusterChanged map[string]str
 
 		if lokiURL == "" || lokiLoglevel == "" || len(lokiTypes) == 0 {
 			d.internalListener.RemoveHandler("loki")
+			if d.lokiClient != nil {
+				d.lokiClient.Stop()
+				d.lokiClient = nil
+			}
 		} else {
 			err := d.setupLoki(lokiURL, lokiUsername, lokiPassword, lokiCACert, lokiInstance, lokiLoglevel, lokiLabels, lokiTypes)
 			if err != nil {

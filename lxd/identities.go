@@ -350,7 +350,17 @@ func identitiesTLSPost(d *Daemon, r *http.Request) response.Response {
 		return createIdentityTLSUntrusted(r.Context(), s, r.TLS.PeerCertificates, networkCert, req, notify)
 	}
 
-	return createIdentityTLSTrusted(r.Context(), s, networkCert, req, notify)
+	var peerCertificates []*x509.Certificate
+	idType, err := requestor.CallerIdentityType()
+	if err == nil {
+		if idType.Name() == api.IdentityTypeBearerTokenInitialUI && r.TLS != nil {
+			// When authenticated as the initial UI identity, allow creating a TLS identity from the presented peer certificate.
+			// This allows LXD UI to establish mTLS by injecting a client certificate during initial UI bearer-token access.
+			peerCertificates = r.TLS.PeerCertificates
+		}
+	}
+
+	return createIdentityTLSTrusted(r.Context(), s, peerCertificates, networkCert, req, notify)
 }
 
 // swagger:operation POST /1.0/auth/identities/bearer identities identities_post_bearer
@@ -381,10 +391,15 @@ func identitiesTLSPost(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	s := d.State()
 
 	req := api.IdentitiesBearerPost{}
-	err := json.NewDecoder(r.Body).Decode(&req)
+	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
 	}
@@ -400,6 +415,10 @@ func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
 
 	if idType.AuthenticationMethod() != api.AuthenticationMethodBearer {
 		return response.BadRequest(fmt.Errorf("Identities of type %q cannot be created via the bearer API", req.Type))
+	}
+
+	if req.Type == api.IdentityTypeBearerTokenInitialUI && requestor.CallerProtocol() != request.ProtocolUnix {
+		return response.Forbidden(errors.New("Initial UI identities may only be created via unix socket"))
 	}
 
 	newIdentityID := uuid.New()
@@ -469,10 +488,32 @@ func identitiesBearerPost(d *Daemon, r *http.Request) response.Response {
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
+	requestor, err := request.GetRequestor(r.Context())
+	if err != nil {
+		return response.SmartError(err)
+	}
+
 	var req api.IdentityBearerTokenPost
-	err := json.NewDecoder(r.Body).Decode(&req)
+	err = json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
 		return response.BadRequest(err)
+	}
+
+	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
+	if err != nil {
+		return response.SmartError(err)
+	}
+
+	if id.Type == api.IdentityTypeBearerTokenInitialUI {
+		if requestor.CallerProtocol() != request.ProtocolUnix {
+			return response.Forbidden(errors.New("Initial UI identity tokens may only be issued via unix socket"))
+		}
+
+		if req.Expiry != "" {
+			return response.BadRequest(errors.New("The initial UI token expiry cannot be set"))
+		}
+
+		req.Expiry = "1d"
 	}
 
 	expiry := req.Expiry
@@ -486,11 +527,6 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 	}
 
 	s := d.State()
-
-	id, err := request.GetContextValue[*dbCluster.Identity](r.Context(), ctxClusterDBIdentity)
-	if err != nil {
-		return response.SmartError(err)
-	}
 
 	var secret []byte
 	err = s.DB.Cluster.Transaction(r.Context(), func(ctx context.Context, tx *db.ClusterTx) error {
@@ -507,7 +543,7 @@ func identityBearerTokenPost(d *Daemon, r *http.Request) response.Response {
 
 	var token string
 	switch id.Type {
-	case api.IdentityTypeBearerTokenClient:
+	case api.IdentityTypeBearerTokenClient, api.IdentityTypeBearerTokenInitialUI:
 		var serverCertFingerprint string
 
 		// When creating LXD bearer tokens, include the server certificate fingerprint.
@@ -642,7 +678,7 @@ func createIdentityTLSUntrusted(ctx context.Context, s *state.State, peerCertifi
 }
 
 // createIdentityTLSTrusted handles requests to create an identity when the caller is trusted.
-func createIdentityTLSTrusted(ctx context.Context, s *state.State, networkCert *shared.CertInfo, req api.IdentitiesTLSPost, notify identityNotificationFunc) response.Response {
+func createIdentityTLSTrusted(ctx context.Context, s *state.State, peerCertificates []*x509.Certificate, networkCert *shared.CertInfo, req api.IdentitiesTLSPost, notify identityNotificationFunc) response.Response {
 	// Check if the caller has permission to create identities.
 	err := s.Authorizer.CheckPermission(ctx, entity.ServerURL(), auth.EntitlementCanCreateIdentities)
 	if err != nil {
@@ -669,7 +705,20 @@ func createIdentityTLSTrusted(ctx context.Context, s *state.State, networkCert *
 		return createIdentityTLSPending(ctx, s, req, notify)
 	}
 
-	fingerprint, metadata, err := validateIdentityCert(networkCert, req.Certificate)
+	cert := req.Certificate
+	if cert == "" && len(peerCertificates) > 0 {
+		// Use peer certificate if no certificate was provided in the request body.
+		peerCert := peerCertificates[len(peerCertificates)-1]
+		peerCertPEM := &pem.Block{
+			Type:  "CERTIFICATE",
+			Bytes: peerCert.Raw,
+		}
+
+		cert = string(pem.EncodeToMemory(peerCertPEM))
+	}
+
+	// Validate the certificate.
+	fingerprint, metadata, err := validateIdentityCert(networkCert, cert)
 	if err != nil {
 		return response.SmartError(err)
 	}
@@ -949,6 +998,49 @@ func tlsIdentityTokenValidate(ctx context.Context, s *state.State, token api.Cer
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 
+// swagger:operation GET /1.0/auth/identities/bearer identities identities_get_bearer
+//
+//	Get the bearer identities
+//
+//	Returns a list of bearer identities (URLs).
+//
+//	---
+//	produces:
+//	  - application/json
+//	responses:
+//	  "200":
+//	    description: API endpoints
+//	    schema:
+//	      type: object
+//	      description: Sync response
+//	      properties:
+//	        type:
+//	          type: string
+//	          description: Response type
+//	          example: sync
+//	        status:
+//	          type: string
+//	          description: Status description
+//	          example: Success
+//	        status_code:
+//	          type: integer
+//	          description: Status code
+//	          example: 200
+//	        metadata:
+//	          type: array
+//	          description: List of endpoints
+//	          items:
+//	            type: string
+//	          example: |-
+//	            [
+//	              "/1.0/auth/identities/bearer/my-identity",
+//	              "/1.0/auth/identities/bearer/2040864b-df39-4267-a8e2-e55cde33601d"
+//	            ]
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+
 // swagger:operation GET /1.0/auth/identities/tls identities identities_get_tls
 //
 //	Get the TLS identities
@@ -1035,6 +1127,44 @@ func tlsIdentityTokenValidate(ctx context.Context, s *state.State, token api.Cer
 //	  "500":
 //	    $ref: "#/responses/InternalServerError"
 
+// swagger:operation GET /1.0/auth/identities/bearer?recursion=1 identities identities_get_bearer_recursion1
+//
+//	Get the bearer identities
+//
+//	Returns a list of bearer identities.
+//
+//	---
+//	produces:
+//	  - application/json
+//	responses:
+//	  "200":
+//	    description: API endpoints
+//	    schema:
+//	      type: object
+//	      description: Sync response
+//	      properties:
+//	        type:
+//	          type: string
+//	          description: Response type
+//	          example: sync
+//	        status:
+//	          type: string
+//	          description: Status description
+//	          example: Success
+//	        status_code:
+//	          type: integer
+//	          description: Status code
+//	          example: 200
+//	        metadata:
+//	          type: array
+//	          description: List of identities
+//	          items:
+//	            $ref: "#/definitions/Identity"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+
 // swagger:operation GET /1.0/auth/identities/tls?recursion=1 identities identities_get_tls_recursion1
 //
 //	Get the TLS identities
@@ -1112,7 +1242,7 @@ func tlsIdentityTokenValidate(ctx context.Context, s *state.State, token api.Cer
 //	    $ref: "#/responses/InternalServerError"
 func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request) response.Response {
 	return func(d *Daemon, r *http.Request) response.Response {
-		recursion := util.IsRecursionRequest(r)
+		recursion, _ := util.IsRecursionRequest(r)
 		s := d.State()
 		canViewIdentity, err := s.Authorizer.GetPermissionChecker(r.Context(), auth.EntitlementCanView, entity.TypeIdentity)
 		if err != nil {
@@ -1174,7 +1304,7 @@ func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request)
 				return nil
 			}
 
-			if recursion && len(identities) == 1 {
+			if recursion > 0 && len(identities) == 1 {
 				// If there is only one identity to return (either the caller can only view themselves, or there is only one identity in database)
 				// we can optimise here by only getting the groups for that user. This sets the value of `apiIdentity`
 				// which is to be returned if non-nil.
@@ -1182,7 +1312,7 @@ func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request)
 				if err != nil {
 					return err
 				}
-			} else if recursion {
+			} else if recursion > 0 {
 				// Otherwise, get all groups and populate the identities outside of the transaction.
 				// This optimisation prevents us from iterating through each identity and querying the database for the
 				// groups of each identity in turn.
@@ -1210,7 +1340,7 @@ func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request)
 			return response.SyncResponse(true, []api.Identity{*apiIdentity})
 		}
 
-		if recursion {
+		if recursion > 0 {
 			// Convert the []cluster.Group in the groupsByIdentityID map to string slices of the group names.
 			groupNamesByIdentityID := make(map[int][]string, len(groupsByIdentityID))
 			for identityID, groups := range groupsByIdentityID {
@@ -1270,6 +1400,41 @@ func identitiesGet(authenticationMethod string) func(d *Daemon, r *http.Request)
 		return response.SyncResponse(true, urls)
 	}
 }
+
+// swagger:operation GET /1.0/auth/identities/bearer/{nameOrIdentifier} identities identity_get_bearer
+//
+//	Get the bearer identity
+//
+//	Gets a specific bearer identity.
+//
+//	---
+//	produces:
+//	  - application/json
+//	responses:
+//	  "200":
+//	    description: API endpoints
+//	    schema:
+//	      type: object
+//	      description: Sync response
+//	      properties:
+//	        type:
+//	          type: string
+//	          description: Response type
+//	          example: sync
+//	        status:
+//	          type: string
+//	          description: Status description
+//	          example: Success
+//	        status_code:
+//	          type: integer
+//	          description: Status code
+//	          example: 200
+//	        metadata:
+//	          $ref: "#/definitions/Identity"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
 
 // swagger:operation GET /1.0/auth/identities/tls/{nameOrIdentifier} identities identity_get_tls
 //
@@ -1490,8 +1655,40 @@ func identityGetCurrent(d *Daemon, r *http.Request) response.Response {
 		EffectiveGroups:      effectiveGroups,
 		EffectivePermissions: effectivePermissions,
 		FineGrained:          identityType.IsFineGrained(),
+		ExpiresAt:            requestor.ExpiresAt(),
 	})
 }
+
+// swagger:operation PUT /1.0/auth/identities/bearer/{nameOrIdentifier} identities identity_put_bearer
+//
+//	Update the bearer identity
+//
+//	Replaces the editable fields of a bearer identity
+//
+//	---
+//	consumes:
+//	  - application/json
+//	produces:
+//	  - application/json
+//	parameters:
+//	  - in: body
+//	    name: identity
+//	    description: Update request
+//	    schema:
+//	      $ref: "#/definitions/IdentityPut"
+//	responses:
+//	  "200":
+//	    $ref: "#/responses/EmptySyncResponse"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "412":
+//	    $ref: "#/responses/PreconditionFailed"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+//	  "501":
+//	    $ref: "#/responses/NotImplemented"
 
 // swagger:operation PUT /1.0/auth/identities/tls/{nameOrIdentifier} identities identity_put_tls
 //
@@ -1725,6 +1922,37 @@ func updateIdentityPrivileged(s *state.State, r *http.Request, id dbCluster.Iden
 
 	return response.EmptySyncResponse
 }
+
+// swagger:operation PATCH /1.0/auth/identities/bearer/{nameOrIdentifier} identities identity_patch_bearer
+//
+//	Partially update the bearer identity
+//
+//	Updates the editable fields of a bearer identity
+//
+//	---
+//	consumes:
+//	  - application/json
+//	produces:
+//	  - application/json
+//	parameters:
+//	  - in: body
+//	    name: identity
+//	    description: Update request
+//	    schema:
+//	      $ref: "#/definitions/IdentityPut"
+//	responses:
+//	  "200":
+//	    $ref: "#/responses/EmptySyncResponse"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "412":
+//	    $ref: "#/responses/PreconditionFailed"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+//	  "501":
+//	    $ref: "#/responses/NotImplemented"
 
 // swagger:operation PATCH /1.0/auth/identities/tls/{nameOrIdentifier} identities identity_patch_tls
 //
@@ -1974,6 +2202,27 @@ func patchSelfIdentityUnprivileged(s *state.State, r *http.Request, id dbCluster
 	return response.EmptySyncResponse
 }
 
+// swagger:operation DELETE /1.0/auth/identities/bearer/{nameOrIdentifier} identities identity_delete_bearer
+//
+//	Delete the bearer identity
+//
+//	Removes the bearer identity.
+//
+//	---
+//	produces:
+//	  - application/json
+//	responses:
+//	  "200":
+//	    $ref: "#/responses/EmptySyncResponse"
+//	  "400":
+//	    $ref: "#/responses/BadRequest"
+//	  "403":
+//	    $ref: "#/responses/Forbidden"
+//	  "500":
+//	    $ref: "#/responses/InternalServerError"
+//	  "501":
+//	    $ref: "#/responses/NotImplemented"
+
 // swagger:operation DELETE /1.0/auth/identities/tls/{nameOrIdentifier} identities identity_delete_tls
 //
 //	Delete the TLS identity
@@ -2026,7 +2275,7 @@ func identityDelete(d *Daemon, r *http.Request) response.Response {
 		return response.SmartError(err)
 	}
 
-	if !identityType.IsFineGrained() {
+	if !identityType.IsFineGrained() && identityType.Name() != api.IdentityTypeBearerTokenInitialUI {
 		return response.NotImplemented(fmt.Errorf("Identities of type %q cannot be modified via this API", id.Type))
 	}
 
@@ -2137,6 +2386,7 @@ func updateIdentityCache(d *Daemon) {
 	clientCerts := make(map[string]*x509.Certificate)
 	metricsCerts := make(map[string]*x509.Certificate)
 	secrets := make(map[string][]byte)
+	var initialUITokenSecret []byte
 	var localServerCerts []dbCluster.Certificate
 	for _, id := range identities {
 		identityType, err := identity.New(string(id.Type))
@@ -2180,6 +2430,11 @@ func updateIdentityCache(d *Daemon) {
 				continue
 			}
 
+			if identityType.Name() == api.IdentityTypeBearerTokenInitialUI {
+				initialUITokenSecret = secret
+				continue
+			}
+
 			secrets[id.Identifier] = secret
 		}
 	}
@@ -2194,7 +2449,7 @@ func updateIdentityCache(d *Daemon) {
 		// continue functioning, and hopefully the write will succeed on next update.
 	}
 
-	d.identityCache.ReplaceAll(serverCerts, clientCerts, metricsCerts, secrets)
+	d.identityCache.ReplaceAll(serverCerts, clientCerts, metricsCerts, secrets, initialUITokenSecret)
 }
 
 // updateIdentityCacheFromLocal loads trusted server certificates from local database into the identity cache.
@@ -2230,6 +2485,6 @@ func updateIdentityCacheFromLocal(d *Daemon) error {
 		serverCerts[dbCert.Fingerprint] = cert
 	}
 
-	d.identityCache.ReplaceAll(serverCerts, nil, nil, nil)
+	d.identityCache.ReplaceAll(serverCerts, nil, nil, nil, nil)
 	return nil
 }

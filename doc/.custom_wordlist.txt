@@ -73,6 +73,7 @@ DevLXD
 DHCP
 DHCPv
 Diffie
+discoverability
 DNS
 DNSSEC
 DoS
@@ -87,6 +88,7 @@ EiB
 Eibit
 endian
 Entra
+Enablement
 EOL
 ES
 ESA
@@ -196,6 +198,7 @@ NIC
 NICs
 NIC's
 NUMA
+numpad
 NVMe
 NVML
 NVRAM
@@ -204,6 +207,7 @@ OAuth
 OCI
 OData
 OIDC
+onboarding
 OpenFGA
 OpenID
 OpenMetrics
@@ -354,6 +358,7 @@ tmpfs
 toleration
 tolerations
 toolchain
+tooltips
 topologies
 TPM
 TSIG

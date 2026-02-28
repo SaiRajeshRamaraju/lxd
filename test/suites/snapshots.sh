@@ -155,7 +155,7 @@ EOF
   ! lxc info foo | grep -wF snap3 || false
 
   # no CLI for this, so we use the API directly (rename a snapshot)
-  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/containers/foo/snapshots/tester" -d '{"name":"tester2"}'
+  wait_for "${LXD_ADDR}" my_curl -X POST --fail-with-body -H 'Content-Type: application/json' "https://${LXD_ADDR}/1.0/instances/foo/snapshots/tester" -d '{"name":"tester2"}'
   # FIXME: make this backend agnostic
   if [ "$lxd_backend" = "dir" ]; then
     [ ! -d "${LXD_DIR}/snapshots/foo/tester" ]
@@ -379,10 +379,10 @@ snap_restore() {
   # Check snapshot creation dates.
   lxc init --empty c1 -d "${SMALL_ROOT_DISK}"
   lxc snapshot c1
-  ! lxc storage volume show "${pool}" container/c1 | grep '^created_at: 0001-01-01T00:00:00Z' || false
-  ! lxc storage volume show "${pool}" container/c1/snap0 | grep '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${pool}" container/c1 | grep '^created_at: 2'
+  lxc storage volume show "${pool}" container/c1/snap0 | grep '^created_at: 2'
   lxc copy c1 c2
-  ! lxc storage volume show "${pool}" container/c2 | grep '^created_at: 0001-01-01T00:00:00Z' || false
+  lxc storage volume show "${pool}" container/c2 | grep '^created_at: 2'
   [ "$(lxc storage volume show "${pool}" container/c1/snap0 | awk /created_at:/)" = "$(lxc storage volume show "${pool}" container/c2/snap0 | awk /created_at:/)" ]
   lxc delete c1 c2
 
@@ -434,7 +434,7 @@ test_snapshot_expiry() {
   [ "$(date -d "${created_at} today + 1days")" = "$(date -d "${expires_at}")" ]
 
   lxc copy c1 c2
-  ! lxc config show c2/snap1 | grep -F 'expires_at: 0001-01-01T00:00:00Z' || false
+  lxc config show c2/snap1 | grep -F 'expires_at: 2'
   [ "$(lxc config get --property c2/snap1 expires_at)" != "0001-01-01 00:00:00 +0000 UTC" ]
 
   lxc snapshot c1 --no-expiry
